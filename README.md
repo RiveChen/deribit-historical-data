@@ -2,9 +2,17 @@
 
 This project fetches historical trade data for all expired option instruments from the Deribit API. The data is saved as CSV files for further analysis.
 
-## tl;dr
+## TL;DR
 
 Clone, install requirements and run.
+
+```sh
+git clone https://github.com/RiveChen/deribit-historical-data.git
+cd deribit-historical-data
+pip install -r requirements.txt
+python deribit_fetcher.py
+```
+
 All you need is ~20min and ~3GB disk space.
 If this helps, a star would be appreciated!
 
@@ -39,7 +47,7 @@ If this helps, a star would be appreciated!
 
 ## Usage
 
-1. Set the desired currency in the `deribit_fetcher.py` file:
+1. (optional) Set the desired currency in the `deribit_fetcher.py` file:
 
     ```python
     CURRENCY = "BTC"  # Change to your desired currency, e.g., "ETH"
@@ -56,9 +64,9 @@ If this helps, a star would be appreciated!
 ## Todo
 
 - [ ] Save as a single `.parquet` file.
-- [ ] Add a CLI interface.
-- [ ] Retrieve non-expired options.
-- [ ] Retrieve other instruments.
+- [x] Add a CLI interface.
+- [x] Retrieve non-expired options.
+- [x] Retrieve other instruments.
 - [ ] Make it a package.
 
 ## License

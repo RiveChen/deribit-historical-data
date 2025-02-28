@@ -7,20 +7,24 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import sleep
 from datetime import datetime
+import pyarrow
 
 DEFAULT_CURRENCY = "BTC"
 DEFAULT_INSTRUMENT = "option"
 DEFAULT_SAVE_PATH = "./data"  # Change this to your preferred data storage folder
+DEFAULT_FORMAT = "csv"
 
 AVAILABLE_CURRENCIES = ["BTC", "ETH", "USDC", "USDT"]  # Supported settlement currencies
 AVAILABLE_INSTRUMENTS = [
     "option",
     "future",
 ]  # Note: Historical API doesn't support spot markets
+AVAILABLE_FORMATS = ["csv", "parquet", "all"]
 
 CURRENCY = DEFAULT_CURRENCY
 INSTRUMENT = DEFAULT_INSTRUMENT
 EXPIRED = "true"
+FORMAT = DEFAULT_FORMAT
 
 SAVE_PATH = DEFAULT_SAVE_PATH
 INSTRUMENTS_FILE = f"{CURRENCY}-{INSTRUMENT}-list.csv"
@@ -29,6 +33,8 @@ BASE_URL = "https://history.deribit.com/api/v2"
 
 MAX_WORKERS = 200  # API rate limit constraint
 MAX_COUNT = 10000  # Maximum results per API request
+
+PARQUET = pd.DataFrame()
 
 
 class TqdmLoggingHandler(logging.Handler):
@@ -93,6 +99,7 @@ def get_trades(instrument: str, start_time_ms, end_time_ms):
 
             if len(trades) == 10000:
                 # Incomplete data, fetch remaining trades
+                # TODO: optimization in fetching futures, especially for perpetual
                 new_end_ms = res["timestamp"].iloc[0] - 1
                 prev_res = get_trades(instrument, start_time_ms, new_end_ms)
                 res = pd.concat([prev_res, res], ignore_index=True)
@@ -124,8 +131,15 @@ def get_all_trades_by_instrument(instrument: str, start_time_ms, end_time_ms):
     df = get_trades(instrument, start_time_ms, end_time_ms)
     if not df.empty:
         filename = f"{instrument}.csv"
-        df.to_csv(os.path.join(SAVE_PATH, filename), index=False)
-        logger.info(f"{instrument} fetched, saved to {filename}")
+        if FORMAT == "csv":
+            df.to_csv(os.path.join(SAVE_PATH, filename), index=False)
+            logger.info(f"{instrument} fetched, saved to {filename}")
+        elif FORMAT == "parquet":
+            pd.concat([PARQUET, df], ignore_index=True)
+        else:
+            df.to_csv(os.path.join(SAVE_PATH, filename), index=False)
+            logger.info(f"{instrument} fetched, saved to {filename}")
+            pd.concat([PARQUET, df], ignore_index=True)
     else:
         logger.info(f"{instrument} has no trades.")
 
@@ -206,6 +220,12 @@ def main():
                 finally:
                     pbar.update(1)
 
+    if FORMAT == "parquet" or FORMAT == "all":
+        PARQUET.to_parquet(
+            os.path.join(SAVE_PATH, f"{CURRENCY}-{INSTRUMENT}.parquet"),
+            engine="pyarrow",
+        )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch historical data from Deribit.")
@@ -214,14 +234,14 @@ if __name__ == "__main__":
         type=str,
         default=DEFAULT_CURRENCY,
         choices=AVAILABLE_CURRENCIES,
-        help=f"Settlement currency for instruments (default: BTC). Options: {AVAILABLE_CURRENCIES}",
+        help="Settlement currency for instruments (default: BTC).",
     )
     parser.add_argument(
         "--kind",
         type=str,
         default=DEFAULT_INSTRUMENT,
         choices=AVAILABLE_INSTRUMENTS,
-        help=f"Instrument type (default: option). Options: {AVAILABLE_INSTRUMENTS}",
+        help="Instrument type (default: option).",
     )
     parser.add_argument(
         "--expired",
@@ -237,6 +257,13 @@ if __name__ == "__main__":
         help=f"Output directory for data storage (default: {SAVE_PATH})",
     )
     parser.add_argument(
+        "--format",
+        type=str,
+        default=DEFAULT_FORMAT,
+        choices=AVAILABLE_FORMATS,
+        help="Output format.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         default=False,
@@ -246,6 +273,7 @@ if __name__ == "__main__":
     CURRENCY = args.currency
     INSTRUMENT = args.kind
     EXPIRED = "true" if args.expired == 1 else "false"
+    FORMAT = args.format
     INSTRUMENTS_FILE = (
         f"{CURRENCY}-{INSTRUMENT}-expired-list.csv"
         if args.expired == 1

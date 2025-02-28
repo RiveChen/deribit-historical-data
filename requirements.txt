@@ -1,3 +1,4 @@
 pandas
+pyarrow
 Requests
 tqdm

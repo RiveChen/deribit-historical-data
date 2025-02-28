@@ -14,11 +14,18 @@ python deribit_fetcher.py
 ```
 
 All you need is ~20min and ~3GB disk space.
+
 If this helps, a star would be appreciated!
+
+For more args:
+
+```sh
+python deribit_fetcher.py -h
+```
 
 ## Features
 
-- Fetches all expired option instruments for a specified currency.
+- Fetches all expired/non-expired option/future instruments for a specified currency.
 - Retrieves all trades for each instrument within its active time range.
 - Saves the fetched data as CSV files.
 - Utilizes multi-threading for efficient data fetching.
@@ -63,10 +70,11 @@ If this helps, a star would be appreciated!
 
 ## Todo
 
-- [ ] Save as a single `.parquet` file.
+- [x] Save as a single `.parquet` file.
 - [x] Add a CLI interface.
 - [x] Retrieve non-expired options.
 - [x] Retrieve other instruments.
+- [ ] Optimize future fetching.
 - [ ] Make it a package.
 
 ## License

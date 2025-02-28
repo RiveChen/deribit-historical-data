@@ -22,7 +22,7 @@ CURRENCY = DEFAULT_CURRENCY
 INSTRUMENT = DEFAULT_INSTRUMENT
 EXPIRED = "true"
 
-SAVE_PATH = os.path.join(DEFAULT_SAVE_PATH, CURRENCY)
+SAVE_PATH = DEFAULT_SAVE_PATH
 INSTRUMENTS_FILE = f"{CURRENCY}-{INSTRUMENT}-list.csv"
 
 BASE_URL = "https://history.deribit.com/api/v2"
@@ -120,14 +120,14 @@ def get_all_trades_by_instrument(instrument: str, start_time_ms, end_time_ms):
         end_time_ms: End timestamp in milliseconds
     """
 
-    logger.debug(f"Processing {instrument}")
+    logger.info(f"Processing {instrument}")
     df = get_trades(instrument, start_time_ms, end_time_ms)
     if not df.empty:
         filename = f"{instrument}.csv"
         df.to_csv(os.path.join(SAVE_PATH, filename), index=False)
-        logger.debug(f"{instrument} fetched, saved to {filename}")
+        logger.info(f"{instrument} fetched, saved to {filename}")
     else:
-        logger.debug(f"{instrument} has no trades.")
+        logger.info(f"{instrument} has no trades.")
 
 
 def get_all_instruments():
@@ -254,5 +254,5 @@ if __name__ == "__main__":
     SAVE_PATH = os.path.join(args.folder, CURRENCY)
     os.makedirs(SAVE_PATH, exist_ok=True)
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger().setLevel(logging.INFO)
     main()

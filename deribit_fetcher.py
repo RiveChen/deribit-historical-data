@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import sleep
 from datetime import datetime
 import pyarrow
-
+import glob
 
 AVAILABLE_CONFIGS = {
     "currency": ["BTC", "ETH", "USDC", "USDT"],
@@ -21,6 +21,7 @@ DEFAULT_CONFIG = {
     "instrument": "option",
     "expired": "true",
     "base_dir": "./data",
+    "save_parquet": False,
 }
 
 CONFIG = DEFAULT_CONFIG
@@ -58,38 +59,15 @@ logger = logging.getLogger(__name__)
 
 
 def bool_to_str(value: bool) -> str:
-    """Convert a boolean value to its string representation.
-
-    Args:
-        value (bool): The boolean value to convert.
-
-    Returns:
-        str: "true" if value is True, "false" otherwise.
-    """
     return "true" if value else "false"
 
 
 def str_to_bool(value: str) -> bool:
-    """Convert a string representation of boolean to actual boolean.
 
-    Args:
-        value (str): The string value to convert.
-
-    Returns:
-        bool: True if value is "true", False otherwise.
-    """
     return value == "true"
 
 
 def bool_to_filename(value: bool) -> str:
-    """Convert a boolean value to a filename-friendly string.
-
-    Args:
-        value (bool): The boolean value to convert.
-
-    Returns:
-        str: "expired" if value is True, "active" otherwise.
-    """
     return "expired" if value else "active"
 
 
@@ -266,7 +244,7 @@ def get_future_trades(
 
 
 def mark_future(instrument: str, start_ms: int, end_ms: int, expired: bool) -> list:
-    """Prepare future trades data for parallel processing.
+    """A wrapper to memorize the start and end timestamps.
 
     Args:
         instrument (str): The name of the future instrument.
@@ -299,8 +277,10 @@ def get_all_future_trades(
     # use parrallel requests for multiple days
     time_range = end_ms - start_ms
     chunk_size = 86400000  # 1 day in ms
+    # TODO: is the split correct?
     chunks = [start_ms + i * chunk_size for i in range(time_range // chunk_size + 1)]
     logger.info(f"Fetching {len(chunks)} chunks for {instrument}")
+    # NOTE: use 1/10 of the max workers for each chunk, this can be optimized
     with ThreadPoolExecutor(max_workers=MAX_WORKERS // 10) as executor:
         futures = [
             executor.submit(mark_future, instrument, chunk, chunk + chunk_size, expired)
@@ -364,6 +344,17 @@ def for_instruments(currency: str, kind: str, expired: bool) -> None:
                 finally:
                     pbar.update(1)
 
+    if CONFIG["save_parquet"]:
+        print(f"Saving {CONFIG['currency']} {kind} data to parquet...")
+        save_to_parquet(
+            os.path.join(
+                CONFIG["base_dir"],
+                CONFIG["currency"],
+                kind,
+                bool_to_filename(expired),
+            )
+        )
+
 
 def prepare_dir(base_dir: str, currency: str) -> None:
     """Create the directory structure for storing data.
@@ -402,6 +393,19 @@ def prepare_dir(base_dir: str, currency: str) -> None:
         )
 
 
+def save_to_parquet(dir_path: str) -> None:
+    """Save all CSV files in the directory to a single Parquet file.
+
+    Args:
+        dir_path (str): The path to the directory containing the CSV files.
+    """
+    # read all csv files in the directory
+    files = glob.glob(os.path.join(dir_path, "*.csv"))
+    # save to parquet
+    df = pd.concat([pd.read_csv(file) for file in files])
+    df.to_parquet(os.path.join(dir_path, "data.parquet"), engine="pyarrow")
+
+
 def main(args) -> None:
     """Main function to orchestrate the data fetching process.
 
@@ -412,6 +416,7 @@ def main(args) -> None:
     CONFIG["instrument"] = args.instrument
     CONFIG["expired"] = args.expired
     CONFIG["base_dir"] = args.base_dir
+    CONFIG["save_parquet"] = args.save_parquet
 
     prepare_dir(CONFIG["base_dir"], CONFIG["currency"])
 
@@ -472,6 +477,11 @@ if __name__ == "__main__":
         "--verbose",
         action="store_true",
         help="Verbose logging",
+    )
+    parser.add_argument(
+        "--save_parquet",
+        action="store_true",
+        help="Save data to a single Parquet file",
     )
     args = parser.parse_args()
     main(args)

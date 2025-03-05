@@ -1,23 +1,10 @@
 # Deribit Historical Data Fetcher
 
-A Python tool for fetching historical trade data from Deribit API, supporting multiple currencies, instrument types, and data organization options.
+A Python tool for fetching historical trade data from Deribit API, supporting BTC/ETH, options/futures, and expired/non-expired instruments.
 
-## Features
+If you encounter any bugs, please report them!
 
-- **Multiple Currency Support**: Fetch data for BTC, ETH, USDC, and USDT
-- **Instrument Types**: Support for both options and futures
-- **Data Organization**:
-  - Separate directories for each currency and instrument type
-  - Organized by expired/active status
-  - CSV format for easy analysis
-- **Efficient Data Collection**:
-  - Multi-threaded data fetching
-  - Automatic rate limiting
-  - Progress tracking with tqdm
-- **Flexible Configuration**:
-  - Command-line interface
-  - Configurable output directory
-  - Verbose logging option
+Stars are appreciated if you find this tool helpful!
 
 ## Quick Start
 
@@ -32,6 +19,22 @@ pip install -r requirements.txt
 # Run with default settings (BTC options)
 python deribit_fetcher.py
 ```
+
+## Features
+
+- **Multiple Currency Support**: Fetch data for BTC, ETH
+- **Instrument Types**: Support for both options and futures
+- **Data Organization**:
+  - Separate directories for each currency and instrument type
+  - Organized by expired/active status
+  - CSV format for easy analysis
+- **Efficient Data Collection**:
+  - Multi-threaded data fetching
+  - Progress tracking with tqdm
+- **Flexible Configuration**:
+  - Command-line interface
+  - Configurable output directory
+  - Verbose logging option
 
 ## Requirements
 
@@ -50,12 +53,12 @@ python deribit_fetcher.py
 python deribit_fetcher.py [options]
 
 Options:
-  --currency {BTC,ETH,USDC,USDT}  Currency to fetch (default: BTC)
+  --currency {BTC,ETH,USDC,USDT}   Currency to fetch (default: BTC)
   --instrument {option,future,all} Instrument type to fetch (default: option)
-  --expired {true,false,all}      Fetch expired or active instruments (default: true)
-  --base_dir DIR                  Base directory for saving data (default: ./data)
-  --verbose                       Enable verbose logging
-  -h, --help                      Show this help message
+  --expired {true,false,all}       Fetch expired or active instruments (default: true)
+  --base_dir DIR                   Base directory for saving data (default: ./data)
+  --verbose                        Enable verbose logging
+  -h, --help                       Show this help message
 ```
 
 ### Examples
@@ -78,7 +81,7 @@ python deribit_fetcher.py --verbose
 
 The fetched data is organized in the following structure:
 
-``` text
+```text
 data/
 ├── {currency}/
 │   ├── option/
@@ -94,20 +97,13 @@ data/
 └── deribit-fetcher.log
 ```
 
-## Implementation Details
-
-- **Rate Limiting**: Uses a maximum of 200 concurrent workers to respect API limits
-- **Data Chunking**: Future trades are split into daily chunks for efficient processing
-- **Error Handling**: Automatic retries for rate limits and connection issues
-- **Progress Tracking**: Real-time progress bars for both overall and per-instrument progress
-
 ## Todo
 
 - [x] Add a CLI interface
 - [x] Retrieve non-expired options
 - [x] Retrieve other instruments
 - [x] Optimize future fetching
-- [ ] Save as a single `.parquet` file
+- [x] Save as a `.parquet` file
 - [ ] Make it a package
 - [ ] Add resume capability for interrupted downloads
 
@@ -117,7 +113,7 @@ This project is licensed under the MIT License. See the `LICENSE` file for detai
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please feel free to submit a Pull Request or create an Issue.
 
 ## Acknowledgements
 

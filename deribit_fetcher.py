@@ -63,7 +63,6 @@ def bool_to_str(value: bool) -> str:
 
 
 def str_to_bool(value: str) -> bool:
-
     return value == "true"
 
 
@@ -115,7 +114,7 @@ def get_all_instruments(currency: str, kind: str, expired: bool) -> pd.DataFrame
 
 
 def do_request(instrument: str, start_ms: int, end_ms: int, expired: bool) -> dict:
-    """Make an API request to fetch trades for a specific instrument.
+    """Make an API request return until success.
 
     Args:
         instrument (str): The name of the instrument to fetch trades for.

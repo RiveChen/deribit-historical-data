@@ -161,24 +161,33 @@ def get_option_trades(
     Returns:
         pd.DataFrame: DataFrame containing all trades, or None if no trades found.
     """
-    res = do_request(instrument, start_ms, end_ms, expired)
-    if res.get("result", {}).get("trades"):
+    dfs = []
+    current_end_ms = end_ms
+
+    while True:
+        res = do_request(instrument, start_ms, current_end_ms, expired)
+        if not res.get("result", {}).get("trades"):
+            break
+
         df = pd.DataFrame(res["result"]["trades"])
-        df.sort_values(by="timestamp", inplace=True)
-        df.reset_index(drop=True, inplace=True)
         if len(df) == 0:
-            return None
-        if len(df) == MAX_COUNT:
-            # not all trades are returned, need to fetch earlier trades
-            new_end_ms = df["timestamp"].iloc[0] - 1
-            prev_res = get_option_trades(instrument, start_ms, new_end_ms, expired)
-            if prev_res is not None:
-                df = pd.concat([prev_res, df], ignore_index=True)
-        else:
-            # all trades are collected
-            pass
-        return df
-    return None
+            break
+
+        dfs.append(df)
+
+        if len(df) < MAX_COUNT:
+            break
+
+        current_end_ms = df["timestamp"].iloc[0] - 1
+        if current_end_ms < start_ms:
+            break
+
+    if not dfs:
+        return None
+
+    df = pd.concat(dfs, ignore_index=True)
+    df.sort_values(by="timestamp", inplace=True)
+    return df
 
 
 def get_all_option_trades(
@@ -222,24 +231,34 @@ def get_future_trades(
     Returns:
         pd.DataFrame: DataFrame containing all trades, or None if no trades found.
     """
-    res = do_request(instrument, start_ms, end_ms, expired)
-    if res.get("result", {}).get("trades"):
+    dfs = []
+    current_end_ms = end_ms
+
+    while True:
+        logger.info(f"Fetching {instrument} from {start_ms} to {current_end_ms}")
+        res = do_request(instrument, start_ms, current_end_ms, expired)
+        if not res.get("result", {}).get("trades"):
+            break
+
         df = pd.DataFrame(res["result"]["trades"])
-        df.sort_values(by="timestamp", inplace=True)
-        df.reset_index(drop=True, inplace=True)
         if len(df) == 0:
-            return None
-        if len(df) == MAX_COUNT:
-            # not all trades are returned, need to fetch earlier trades
-            new_end_ms = df["timestamp"].iloc[0] - 1
-            prev_res = get_future_trades(instrument, start_ms, new_end_ms, expired)
-            if prev_res is not None:
-                df = pd.concat([prev_res, df], ignore_index=True)
-        else:
-            # all trades are collected
-            pass
-        return df
-    return None
+            break
+
+        dfs.append(df)
+
+        if len(df) < MAX_COUNT:
+            break
+
+        current_end_ms = df["timestamp"].iloc[0] - 1
+        if current_end_ms < start_ms:
+            break
+
+    if not dfs:
+        return None
+
+    df = pd.concat(dfs, ignore_index=True)
+    df.sort_values(by="timestamp", inplace=True)
+    return df
 
 
 def mark_future(instrument: str, start_ms: int, end_ms: int, expired: bool) -> list:
@@ -254,6 +273,7 @@ def mark_future(instrument: str, start_ms: int, end_ms: int, expired: bool) -> l
     Returns:
         list: List containing [DataFrame, start_ms, end_ms].
     """
+    logger.info(f"Handling {instrument} from {start_ms} to {end_ms}")
     return [
         get_future_trades(instrument, start_ms, end_ms, expired),
         start_ms,
@@ -276,27 +296,44 @@ def get_all_future_trades(
     # use parrallel requests for multiple days
     time_range = end_ms - start_ms
     chunk_size = 86400000  # 1 day in ms
-    # TODO: is the split correct?
     chunks = [start_ms + i * chunk_size for i in range(time_range // chunk_size + 1)]
+    logger.info(f"Time range: {time_range}, start_ms: {start_ms}, end_ms: {end_ms}")
     logger.info(f"Fetching {len(chunks)} chunks for {instrument}")
-    # NOTE: use 1/10 of the max workers for each chunk, this can be optimized
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS // 10) as executor:
-        futures = [
-            executor.submit(mark_future, instrument, chunk, chunk + chunk_size, expired)
-            for chunk in chunks
-        ]
-        for future in as_completed(futures):
-            df, start_ms, end_ms = future.result()
-            if df is not None:
-                df.to_csv(
-                    os.path.join(
-                        CONFIG["base_dir"],
-                        CONFIG["currency"],
+
+    # Process chunks in smaller batches to manage memory
+    batch_size = 20
+    for i in range(0, len(chunks), batch_size):
+        batch_chunks = chunks[i : i + batch_size]
+        logger.info(
+            f"Processing {instrument} batch {i // batch_size + 1} of {len(chunks) // batch_size}"
+        )
+        base_dir = CONFIG["base_dir"]
+        currency = CONFIG["currency"]
+        with ThreadPoolExecutor(
+            max_workers=min(len(batch_chunks), MAX_WORKERS // 5)
+        ) as executor:
+            futures = [
+                executor.submit(
+                    mark_future, instrument, chunk, chunk + chunk_size - 1, expired
+                )
+                for chunk in batch_chunks
+            ]
+            for future in as_completed(futures):
+                df, chunk_start_ms, chunk_end_ms = future.result()
+                logger.info(
+                    f"Processing {instrument} chunk {chunk_start_ms} to {chunk_end_ms}"
+                )
+                if df is not None:
+                    output_path = os.path.join(
+                        base_dir,
+                        currency,
                         "future",
                         bool_to_filename(expired),
-                        f"{instrument}-{start_ms}-{end_ms}.csv",
-                    ),
-                )
+                        f"{instrument}-{chunk_start_ms}-{chunk_end_ms}.csv",
+                    )
+                    df.to_csv(output_path, index=False)
+                    del df  # Explicitly delete DataFrame to free memory
+                del future  # Clean up future object
 
 
 def for_instruments(currency: str, kind: str, expired: bool) -> None:
@@ -321,7 +358,7 @@ def for_instruments(currency: str, kind: str, expired: bool) -> None:
             start_time_ms = row.creation_timestamp
             # if fetching non-expired instruments, limit end_time_ms
             end_time_ms = row.expiration_timestamp
-            if expired:
+            if not expired:
                 end_time_ms = min(end_time_ms, int(FROZEN_TIME.timestamp() * 1000))
 
             future = executor.submit(
@@ -400,9 +437,47 @@ def save_to_parquet(dir_path: str) -> None:
     """
     # read all csv files in the directory
     files = glob.glob(os.path.join(dir_path, "*.csv"))
-    # save to parquet
-    df = pd.concat([pd.read_csv(file) for file in files])
-    df.to_parquet(os.path.join(dir_path, "data.parquet"), engine="pyarrow")
+    if not files:
+        logger.warning(f"No CSV files found in {dir_path}")
+        return
+
+    # Read first file to get common columns
+    first_df = pd.read_csv(files[0])
+    common_columns = set(first_df.columns)
+
+    # Find common columns across all files
+    for file in files[1:]:
+        df = pd.read_csv(file)
+        common_columns &= set(df.columns)
+
+    common_columns = list(common_columns)
+
+    # Create parquet writer
+    parquet_path = os.path.join(dir_path, "data.parquet")
+    writer = None
+
+    try:
+        # Process each file in chunks
+        for file in files:
+            for chunk in pd.read_csv(file, usecols=common_columns, chunksize=100000):
+                if writer is None:
+                    writer = pd.io.parquet.PyArrowWriter(
+                        parquet_path,
+                        engine="pyarrow",
+                        schema=chunk[common_columns].schema,
+                    )
+                writer.write(chunk[common_columns])
+
+        if writer is not None:
+            writer.close()
+
+    except Exception as e:
+        logger.error(f"Error saving parquet file: {e}")
+        if writer is not None:
+            writer.close()
+        if os.path.exists(parquet_path):
+            os.remove(parquet_path)
+        raise
 
 
 def main(args) -> None:

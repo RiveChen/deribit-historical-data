@@ -22,6 +22,7 @@ DEFAULT_CONFIG = {
     "expired": "true",
     "base_dir": "./data",
     "save_parquet": False,
+    "verbose": False,
 }
 
 CONFIG = DEFAULT_CONFIG
@@ -295,8 +296,15 @@ def get_all_future_trades(
     # split the time range into multiple requests
     # use parrallel requests for multiple days
     time_range = end_ms - start_ms
-    chunk_size = 86400000  # 1 day in ms
-    chunks = [start_ms + i * chunk_size for i in range(time_range // chunk_size + 1)]
+    # ! TODO: make this adjustable, for some active futures, trades number can exceed 10000 in 1 minute
+    chunk_size = 4 * 3600000  # 4 hours in ms
+    chunks = []
+    i = 0
+    while True:
+        chunks.append(start_ms + i * chunk_size)
+        if start_ms + i * chunk_size > end_ms:
+            break
+        i += 1
     logger.info(f"Time range: {time_range}, start_ms: {start_ms}, end_ms: {end_ms}")
     logger.info(f"Fetching {len(chunks)} chunks for {instrument}")
 
@@ -314,7 +322,11 @@ def get_all_future_trades(
         ) as executor:
             futures = [
                 executor.submit(
-                    mark_future, instrument, chunk, chunk + chunk_size - 1, expired
+                    mark_future,
+                    instrument,
+                    chunk,
+                    min(chunk + chunk_size - 1, end_ms),
+                    expired,
                 )
                 for chunk in batch_chunks
             ]
@@ -491,10 +503,10 @@ def main(args) -> None:
     CONFIG["expired"] = args.expired
     CONFIG["base_dir"] = args.base_dir
     CONFIG["save_parquet"] = args.save_parquet
-
+    CONFIG["verbose"] = args.verbose
     prepare_dir(CONFIG["base_dir"], CONFIG["currency"])
 
-    if args.verbose:
+    if CONFIG["verbose"]:
         logger.setLevel(logging.INFO)
         # add file handler
         logger.addHandler(

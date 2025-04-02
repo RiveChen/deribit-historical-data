@@ -16,8 +16,8 @@ cd deribit-historical-data
 # Install dependencies
 pip install -r requirements.txt
 
-# Run with default settings (BTC options)
-python deribit_fetcher.py
+# Run with default settings (BTC expired options)
+python -m deribit_fetcher
 ```
 
 ## Features
@@ -33,7 +33,6 @@ python deribit_fetcher.py
   - Progress tracking with tqdm
 - **Flexible Configuration**:
   - Command-line interface
-  - Configurable output directory
   - Verbose logging option
 
 ## Requirements
@@ -50,7 +49,7 @@ python deribit_fetcher.py
 ### Command Line Arguments
 
 ```text
-python deribit_fetcher.py [options]
+python -m deribit_fetcher [options]
 
 Options:
   --currency {BTC,ETH,USDC,USDT}   Currency to fetch (default: BTC)
@@ -65,16 +64,13 @@ Options:
 
 ```sh
 # Fetch all expired ETH options
-python deribit_fetcher.py --currency ETH --instrument option --expired true
+python -m deribit_fetcher --currency ETH --instrument option --expired true
 
 # Fetch active BTC futures
-python deribit_fetcher.py --currency BTC --instrument future --expired false
-
-# Fetch all instruments for USDT
-python deribit_fetcher.py --currency USDT --instrument all --expired all
+python -m deribit_fetcher --currency BTC --instrument future --expired false
 
 # Enable verbose logging
-python deribit_fetcher.py --verbose
+python -m deribit_fetcher --verbose
 ```
 
 ## Data Structure
@@ -101,11 +97,9 @@ data/
 
 - [x] Add a CLI interface
 - [x] Retrieve non-expired options
-- [x] Retrieve other instruments
-- [x] Optimize future fetching
-- [x] Save as a `.parquet` file
-- [ ] Make it a package
-- [ ] Add resume capability for interrupted downloads
+- [x] Retrieve futures
+- [x] Make it a package
+- [ ] Sort `.csv` files into a `.parquet` file
 
 ## License
 

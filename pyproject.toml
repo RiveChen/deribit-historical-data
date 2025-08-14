@@ -1,0 +1,11 @@
+[project]
+name = "deribit-historical-data"
+version = "0.1.0"
+description = "Fetch historical trades from Deribit via history API"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas>=2.3.1",
+    "requests>=2.32.4",
+    "tqdm>=4.67.1",
+]

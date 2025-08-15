@@ -5,10 +5,14 @@ import concurrent.futures
 from tqdm import tqdm
 import time
 
+BASE_DIR = "data"
+TRADES_DIR = "option"
+LIST_FILE = "instruments.csv"
+
 
 def get_list():
-    if os.path.exists("instruments.csv"):
-        df = pd.read_csv("instruments.csv")
+    if os.path.exists(f"{BASE_DIR}/{LIST_FILE}"):
+        df = pd.read_csv(f"{BASE_DIR}/{LIST_FILE}")
     else:
         url = f"https://history.deribit.com/api/v2/public/get_instruments"
         params = {
@@ -24,7 +28,7 @@ def get_list():
         active_df = pd.DataFrame(response.json()["result"])
 
         df = pd.concat([expired_df, active_df])
-        df.to_csv("instruments.csv", index=False)
+        df.to_csv(f"{BASE_DIR}/{LIST_FILE}", index=False)
 
     df = df[["instrument_name", "creation_timestamp", "expiration_timestamp"]]
     result = list(df.itertuples(index=False, name=None))
@@ -51,7 +55,7 @@ def get_trades(url, params):
     return res["trades"]
 
 
-def get_data_by_seq(name, start_seq=1, end_seq=10000, count=10000):
+def get_data_by_seq_recur(name, start_seq=1, end_seq=10000, count=10000):
     url = f"https://history.deribit.com/api/v2/public/get_last_trades_by_instrument"
     params = {
         "instrument_name": name,
@@ -63,12 +67,12 @@ def get_data_by_seq(name, start_seq=1, end_seq=10000, count=10000):
     trades = get_trades(url, params)
 
     if len(trades) == count:
-        trades += get_data_by_seq(name, end_seq + 1, end_seq + count, count)
+        trades += get_data_by_seq_recur(name, end_seq + 1, end_seq + count, count)
 
     return trades
 
 
-def get_data_by_ts(name, start_ts, end_ts, count=10000):
+def get_data_by_ts_recur(name, start_ts, end_ts, count=10000):
     url = f"https://history.deribit.com/api/v2/public/get_last_trades_by_instrument_and_time"
     params = {
         "instrument_name": name,
@@ -81,7 +85,7 @@ def get_data_by_ts(name, start_ts, end_ts, count=10000):
 
     if len(trades) == count:
         new_end_ts = min(trade["timestamp"] for trade in trades) - 1
-        trades += get_data_by_ts(name, start_ts, new_end_ts, count)
+        trades += get_data_by_ts_recur(name, start_ts, new_end_ts, count)
 
     return trades
 
@@ -93,23 +97,24 @@ def process_trades(name, trades):
     df = pd.DataFrame(trades)
     df.set_index("trade_seq", inplace=True)
     df.sort_index(inplace=True)
-    df.to_csv(f"data/{name}.csv", index=True)
+    df.to_csv(f"{BASE_DIR}/{TRADES_DIR}/{name}.csv", index=True)
 
 
 def main():
     print("Hello from deribit-historical-data!")
-    if not os.path.exists("data"):
-        os.makedirs("data")
+
+    if not os.path.exists(f"{BASE_DIR}/{TRADES_DIR}"):
+        os.makedirs(f"{BASE_DIR}/{TRADES_DIR}")
 
     list = get_list()
-    print("Total instruments: ", len(list))
+    print("Total options: ", len(list))
 
     MAX_WORKERS = 200  # Set your desired concurrency limit here
     list.reverse()
 
     def fetch_and_process(item):
         name = item[0]
-        trades = get_data_by_ts(name, item[1], item[2])
+        trades = get_data_by_ts_recur(name, item[1], item[2])
         process_trades(name, trades)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -117,6 +122,7 @@ def main():
 
         for future in tqdm(concurrent.futures.as_completed(futures), total=len(list)):
             future.result()
+
     # print(len(get_data_by_seq("BTC-28JUN24-100000-C")))
     # print(len(get_data_by_seq("BTC-27DEC24-100000-C")))
     # btc_tuple = next((item for item in list if item[0] == "BTC-27DEC24-100000-C"), None)

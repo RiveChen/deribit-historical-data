@@ -105,7 +105,7 @@ def process_trades(name, trades, start_seq, end_seq):
     df.to_csv(f"{BASE_DIR}/{TRADES_DIR}/{name}_{start_seq}-{end_seq}.csv", index=True)
 
 
-def main() -> None:
+def main():
     print("future fetch started")
 
     if not os.path.exists(f"{BASE_DIR}/{TRADES_DIR}"):
@@ -118,15 +118,14 @@ def main() -> None:
     for i, item in enumerate(list):
         latest_seq = get_latest_seq_by_ts(item[0], item[2])
         if latest_seq == 0:
-            print(f"( {i+1}/{len(list)}) No data for {item[0]}")
+            print(f"({i+1}/{len(list)}) No data for {item[0]}")
             continue
         ranges = [
             (item[0], start, min(start + 9999, latest_seq))
             for start in range(1, latest_seq, 10000)
         ]
-        print(f"( {i+1}/{len(list)}) Fetching {item[0]}")
 
-        MAX_WORKERS = 100
+        MAX_WORKERS = 20
 
         def fetch_and_process(item):
             name = item[0]
@@ -136,7 +135,9 @@ def main() -> None:
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             futures = [executor.submit(fetch_and_process, item) for item in ranges]
             for future in tqdm(
-                concurrent.futures.as_completed(futures), total=len(ranges)
+                concurrent.futures.as_completed(futures),
+                total=len(ranges),
+                desc=f"({i+1}/{len(list)}) Fetching {item[0]}",
             ):
                 future.result()
 

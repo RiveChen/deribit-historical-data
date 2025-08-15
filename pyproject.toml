@@ -6,6 +6,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "pandas>=2.3.1",
+    "pyarrow>=21.0.0",
     "requests>=2.32.4",
     "tqdm>=4.67.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.30.1",
 ]

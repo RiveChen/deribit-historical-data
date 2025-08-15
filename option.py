@@ -2,6 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "pandas",
+#     "pyarrow",
 #     "requests",
 #     "tqdm",
 # ]
@@ -9,6 +10,7 @@
 
 import os
 import time
+import glob
 import concurrent.futures
 
 import requests
@@ -18,6 +20,8 @@ from tqdm import tqdm
 BASE_DIR = "data"
 TRADES_DIR = "option"
 LIST_FILE = "option-list.csv"
+MERGED_FILE = "options_merged.parquet"
+JOINED_FILE = "options.parquet"
 
 
 def get_list():
@@ -106,7 +110,98 @@ def process_trades(name, trades):
     df.to_csv(f"{BASE_DIR}/{TRADES_DIR}/{name}.csv", index=True)
 
 
-def main():
+TRADE_DTYPE_SPEC = {
+    "trade_seq": "int64",
+    "trade_id": "int64",
+    "timestamp": "int64",
+    "tick_direction": "int8",
+    "price": "float64",
+    "mark_price": "float64",
+    "iv": "float32",
+    "instrument_name": "str",
+    "index_price": "float64",
+    "direction": "category",
+    "contracts": "float64",
+    "amount": "float64",
+    "block_trade_leg_count": "float32",
+    "block_trade_id": "str",
+    "block_rfq_id": "float32",
+    "combo_id": "str",
+    "combo_trade_id": "Int32",
+}
+
+LIST_DTYPE_SPEC = {
+    "tick_size_steps": "category",
+    "tick_size": "category",
+    "taker_commission": "category",
+    "strike": "float64",
+    "settlement_period": "category",
+    "settlement_currency": "category",
+    "rfq": "bool",
+    "quote_currency": "category",
+    "price_index": "category",
+    "option_type": "category",
+    "min_trade_amount": "category",
+    "maker_commission": "category",
+    "kind": "category",
+    "is_active": "bool",
+    "instrument_name": "str",
+    "instrument_id": "int64",
+    "expiration_timestamp": "int64",
+    "creation_timestamp": "int64",
+    "counter_currency": "category",
+    "contract_size": "float64",
+    "block_trade_tick_size": "float64",
+    "block_trade_min_trade_amount": "float64",
+    "block_trade_commission": "float64",
+    "base_currency": "category",
+    "base_currency_conversion_rate": "float64",
+    "base_currency_conversion_rate_exponent": "Int64",
+    "base_currency_conversion_rate_precision": "Int64",
+}
+
+
+def merge_all_csv():
+    print("option merge started")
+
+    # Find all trade CSV files in the directory
+    csv_files = glob.glob(f"{BASE_DIR}/{TRADES_DIR}/*.csv")
+
+    dfs = []
+    for file in tqdm(csv_files, desc="Reading CSV files"):
+        try:
+            df = pd.read_csv(file, dtype=TRADE_DTYPE_SPEC, index_col=0)
+            dfs.append(df)
+        except Exception as e:
+            print(f"error reading {file}: {e}")
+            print(df.info())
+            exit()
+
+    if not dfs:
+        print("no data to merge")
+        return
+
+    print("concatenating dataframes")
+    merged_df = pd.concat(dfs, axis=0, ignore_index=True)
+    merged_df.to_parquet(f"{BASE_DIR}/{MERGED_FILE}", compression="zstd")
+
+    print("option merge completed")
+
+
+def join_with_list():
+    print("merging with list")
+
+    list_df = pd.read_csv(f"{BASE_DIR}/{LIST_FILE}", dtype=LIST_DTYPE_SPEC)
+    merged_df = pd.read_parquet(f"{BASE_DIR}/{MERGED_FILE}")
+    joined_df = merged_df.merge(list_df, on="instrument_name", how="left")
+    joined_df.set_index("trade_id", inplace=True)
+    joined_df.sort_index(inplace=True)
+    joined_df.to_parquet(f"{BASE_DIR}/{JOINED_FILE}", compression="zstd")
+
+    print("join completed")
+
+
+def fetch():
     print("option fetch started")
 
     if not os.path.exists(f"{BASE_DIR}/{TRADES_DIR}"):
@@ -116,7 +211,7 @@ def main():
     # list.reverse()
     print("Total options: ", len(list))
 
-    MAX_WORKERS = 200  # Set your desired concurrency limit here
+    MAX_WORKERS = 20  # Set your desired concurrency limit here
 
     def fetch_and_process(item):
         name = item[0]
@@ -139,4 +234,6 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    fetch()
+    # merge_all_csv()
+    # join_with_list()

@@ -1,13 +1,23 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "pandas",
+#     "requests",
+#     "tqdm",
+# ]
+# ///
+
 import os
+import time
+import concurrent.futures
+
 import requests
 import pandas as pd
-import concurrent.futures
 from tqdm import tqdm
-import time
 
 BASE_DIR = "data"
 TRADES_DIR = "option"
-LIST_FILE = "instruments.csv"
+LIST_FILE = "option-list.csv"
 
 
 def get_list():
@@ -65,10 +75,8 @@ def get_data_by_seq_recur(name, start_seq=1, end_seq=10000, count=10000):
     }
 
     trades = get_trades(url, params)
-
     if len(trades) == count:
         trades += get_data_by_seq_recur(name, end_seq + 1, end_seq + count, count)
-
     return trades
 
 
@@ -82,11 +90,9 @@ def get_data_by_ts_recur(name, start_ts, end_ts, count=10000):
     }
 
     trades = get_trades(url, params)
-
     if len(trades) == count:
         new_end_ts = min(trade["timestamp"] for trade in trades) - 1
         trades += get_data_by_ts_recur(name, start_ts, new_end_ts, count)
-
     return trades
 
 
@@ -101,16 +107,16 @@ def process_trades(name, trades):
 
 
 def main():
-    print("Hello from deribit-historical-data!")
+    print("option fetch started")
 
     if not os.path.exists(f"{BASE_DIR}/{TRADES_DIR}"):
         os.makedirs(f"{BASE_DIR}/{TRADES_DIR}")
 
     list = get_list()
+    # list.reverse()
     print("Total options: ", len(list))
 
     MAX_WORKERS = 200  # Set your desired concurrency limit here
-    list.reverse()
 
     def fetch_and_process(item):
         name = item[0]
@@ -128,6 +134,8 @@ def main():
     # btc_tuple = next((item for item in list if item[0] == "BTC-27DEC24-100000-C"), None)
     # print(btc_tuple)
     # print(len(get_data_by_ts(btc_tuple[0], btc_tuple[1], btc_tuple[2])))
+
+    print("option fetch completed")
 
 
 if __name__ == "__main__":

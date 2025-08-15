@@ -1,13 +1,15 @@
-# tl;dr
+# Deribit Historical Data
 
-Install `uv` and run the script.
+## TL;DR
+
+Install `uv` and run the script, the data will be stored in `./data/` directory.
 
 ```bash
 uv run option.py # fetch BTC option trades
 uv run future.py # fetch BTC future trades
 ```
 
-Data will be stored in `data/` directory.
+If it helps, stars are appreciated!
 
 ## Credits
 

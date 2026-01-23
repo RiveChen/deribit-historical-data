@@ -70,11 +70,34 @@ class DeribitClient:
             }
         )
 
+    def set_stop_event(self, event: threading.Event):
+        """设置外部停止信号，用于优雅退出重试循环"""
+        self.stop_event = event
+
+    @staticmethod
+    def _check_stop_event(retry_state):
+        """回调函数：每次重试休眠前检查停止信号"""
+        # 从 retry_state 获取 self 实例
+        # retry_state.args[0] 是 request 方法的 self 参数
+        if retry_state.args and len(retry_state.args) > 0:
+            self_instance = retry_state.args[0]
+            if (
+                hasattr(self_instance, "stop_event")
+                and self_instance.stop_event.is_set()
+            ):
+                logger.warning("Stop event detected. Aborting retry loop.")
+                raise KeyboardInterrupt("Stop event detected")
+
+        # 原有的日志逻辑
+        if retry_state.outcome.failed:
+            ex = retry_state.outcome.exception()
+            logger.warning(f"Retrying {retry_state.attempt_number}: {ex}")
+
     @retry(
         stop=stop_never,  # 永不停止，直到成功
         wait=wait_exponential(multiplier=1, min=2, max=60),  # 2s, 4s, 8s...
         retry=retry_if_exception_type((requests.RequestException, Exception)),
-        before_sleep=before_sleep_log(logger, logging.WARNING),
+        before_sleep=_check_stop_event,  # 使用自定义回调
     )
     def request(
         self, endpoint: str, params: Optional[Dict[str, Any]] = None
@@ -84,6 +107,10 @@ class DeribitClient:
         """
         # 1. 进入限流等待
         self.limiter.wait()
+
+        # 检查停止信号 (Request 前)
+        if hasattr(self, "stop_event") and self.stop_event.is_set():
+            raise KeyboardInterrupt("Stop event detected")
 
         url = f"{self.api_base}/{endpoint}"
         try:

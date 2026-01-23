@@ -18,6 +18,8 @@ class BaseFetcher:
         self.storage = storage
         self.max_workers = max_workers
         self.stop_event = threading.Event()
+        # 将停止信号传递给 Client，以便中断无限重试
+        self.client.set_stop_event(self.stop_event)
 
     def get_instruments(self, currency: str, kind: str) -> List[Dict]:
         """获取所有品种（包括已过期的）"""

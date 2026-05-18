@@ -136,15 +136,15 @@ def generate_parquet(
                                 pl.col("instrument_name"),
                                 pl.col("trade_seq").cast(pl.Int64),
                             )
-                            mask = ~key_struct.is_in(
-                                pl.Series(
-                                    "prev",
-                                    [
-                                        {"instrument_name": k[0], "trade_seq": k[1]}
-                                        for k in prev_keys
-                                    ],
-                                )
-                            )
+                            # implode() creates a List(struct) to avoid ambiguous is_in deprecation
+                            prev_series = pl.Series(
+                                "prev",
+                                [
+                                    {"instrument_name": k[0], "trade_seq": k[1]}
+                                    for k in prev_keys
+                                ],
+                            ).implode()
+                            mask = ~key_struct.is_in(prev_series)
                             before = len(df)
                             df = df.filter(mask)
                             cross_dup = before - len(df)

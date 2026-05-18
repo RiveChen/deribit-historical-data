@@ -1,17 +1,28 @@
 [project]
-name = "deribit-historical-data"
-version = "0.1.0"
-description = "Fetch historical trades from Deribit via history API"
+name = "deribit-fetcher"
+version = "0.0.1"
+description = "Fetching Deribit historical trades(transactions) via Deribit Historical API."
 readme = "README.md"
+authors = [
+    { name = "RiveChen", email = "155357736+RiveChen@users.noreply.github.com" },
+]
 requires-python = ">=3.10"
 dependencies = [
-    "pandas>=2.3.1",
-    "pyarrow>=21.0.0",
-    "requests>=2.32.4",
-    "tqdm>=4.67.1",
+    "requests",
+    "pandas",
+    "tqdm",
+    "backoff",
+    "tenacity",
+    "pytest>=9.0.2",
+    "aiohttp>=3.13.3",
+    "aiosqlite>=0.22.1",
+    "httpx[socks]>=0.28.1",
+    "orjson>=3.11.7",
+    "aiolimiter>=1.2.1",
+    "polars>=1.38.0",
+    "pyarrow>=23.0.0",
 ]
 
-[dependency-groups]
-dev = [
-    "ipykernel>=6.30.1",
-]
+[build-system]
+requires = ["uv_build>=0.9.26,<0.10.0"]
+build-backend = "uv_build"

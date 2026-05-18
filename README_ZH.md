@@ -9,7 +9,8 @@
 - **断点续传** — SQLite 检查点数据库记录进度，部分下载可从中断处恢复
 - **优雅关闭** — 处理 `SIGINT`/`SIGTERM` 信号，保留已收集的全部数据
 - **JSONL 输出** — 原始数据保存为换行符分隔的 JSON，每行一笔成交
-- **Parquet 导出** — 工具脚本可将所有 JSONL 文件合并为单个压缩 Parquet 文件
+- **Parquet 导出** — 工具脚本可将所有 JSONL 文件合并为单个压缩 Parquet 文件（支持去重）
+- **数据校验** — 下载后完整性检查（序列号间隙检测、重复检测、Schema 分析）
 - **支持多种币种和品种** — 支持 BTC 和 ETH，期货和期权
 
 ## 环境要求
@@ -71,12 +72,32 @@ uv run python -m deribit_fetcher.option
 
 ### 3. 导出为 Parquet
 
+Parquet 生成器将所有 JSONL 文件合并为单个压缩 Parquet 文件，支持去重。
+
 ```bash
 # 将所有 BTC 期货 JSONL 合并为单个 Parquet
-uv run python -m deribit_fetcher.gen_parquet --type future
+uv run python scripts/gen_parquet.py --type future
 
 # 将所有 BTC 期权 JSONL 合并
-uv run python -m deribit_fetcher.gen_parquet --type option
+uv run python scripts/gen_parquet.py --type option
+
+# 跳过去重（速度更快，但可能包含重复行）
+uv run python scripts/gen_parquet.py --type future --no-dedup
+```
+
+### 4. 数据校验
+
+下载后检查数据完整性 — 检测间隙、重复，并报告每个交易对的统计信息。
+
+```bash
+# 校验期货和期权数据（JSONL + Parquet）
+uv run python scripts/validate_data.py
+
+# 仅校验 JSONL 文件
+uv run python scripts/validate_data.py --mode jsonl
+
+# 仅校验特定类型
+uv run python scripts/validate_data.py --type future
 ```
 
 ### 输出目录结构
@@ -108,8 +129,12 @@ src/deribit_fetcher/
 ├── option.py            # 期权数据爬虫（入口）
 ├── progress.py          # SQLite 检查点数据库
 ├── storage.py           # JSONL 文件写入器
-├── log.py               # 日志配置（兼容 tqdm）
-└── gen_parquet.py       # JSONL → Parquet 转换
+└── log.py               # 日志配置（兼容 tqdm）
+
+scripts/
+├── gen_parquet.py       # JSONL → Parquet 转换
+├── validate_data.py     # 下载后数据完整性校验
+└── test_real_api.py     # Deribit API 行为测试工具
 ```
 
 ## 工作原理
@@ -143,4 +168,4 @@ src/deribit_fetcher/
 
 - **块边界重叠**：Deribit 偶尔会在块边界返回 1 条重叠的成交。这可以容忍 — 重复数据可在 Parquet 转换阶段按 `(instrument_name, trade_seq)` 去重。
 - **无成交交易对**：部分早期过期的交易对没有任何成交，自动跳过。
-- **成交结构**：期货和期权的成交共享相同的 10 字段结构（经真实 API 测试确认）。Parquet 生成器使用更宽的 schema 以捕获可选字段（如 `liquidation`、`block_trade_id` 等）。
+- **成交结构**：期货和期权的成交共享相同的字段（经真实 API 测试确认的 17 字段 union schema）。Parquet 生成器使用完整的 schema 以捕获所有字段，包括罕见的 `liquidation`、`block_trade_id`、`block_rfq_id`、`combo_id` 等，缺失字段自动填充为 null。

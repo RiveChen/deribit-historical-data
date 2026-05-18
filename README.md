@@ -9,7 +9,8 @@
 - **Resumable** — SQLite checkpoint database tracks progress, so partial downloads can be resumed
 - **Graceful shutdown** — handles `SIGINT`/`SIGTERM` cleanly, preserving all data collected so far
 - **JSONL output** — raw data saved as newline-delimited JSON, one trade per line
-- **Parquet export** — utility to merge all JSONL files into a single compressed Parquet file
+- **Parquet export** — utility script to merge all JSONL files into a single compressed Parquet file (with dedup)
+- **Data validation** — post-download integrity checks (gap detection, duplicates, schema analysis)
 - **Both currency & instrument kinds** — supports BTC and ETH, Futures and Options
 
 ## Requirements
@@ -71,12 +72,32 @@ uv run python -m deribit_fetcher.option
 
 ### 3. Export to Parquet
 
+The Parquet generator merges all JSONL files into a single compressed Parquet file with dedup support.
+
 ```bash
 # Merge all BTC future JSONL files into a single Parquet
-uv run python -m deribit_fetcher.gen_parquet --type future
+uv run python scripts/gen_parquet.py --type future
 
 # Merge all BTC option JSONL files
-uv run python -m deribit_fetcher.gen_parquet --type option
+uv run python scripts/gen_parquet.py --type option
+
+# Skip deduplication (faster, but may contain duplicate rows)
+uv run python scripts/gen_parquet.py --type future --no-dedup
+```
+
+### 4. Validate Data
+
+Check data integrity after download — detects gaps, duplicates, and reports per-instrument statistics.
+
+```bash
+# Validate both future and option data (JSONL + Parquet)
+uv run python scripts/validate_data.py
+
+# Validate only JSONL files
+uv run python scripts/validate_data.py --mode jsonl
+
+# Validate only a specific type
+uv run python scripts/validate_data.py --type future
 ```
 
 ### Output Structure
@@ -108,8 +129,12 @@ src/deribit_fetcher/
 ├── option.py            # Option data fetcher (entry point)
 ├── progress.py          # SQLite checkpoint database
 ├── storage.py           # JSONL file writer
-├── log.py               # Logging setup (tqdm-compatible)
-└── gen_parquet.py       # JSONL → Parquet conversion
+└── log.py               # Logging setup (tqdm-compatible)
+
+scripts/
+├── gen_parquet.py       # JSONL → Parquet conversion
+├── validate_data.py     # Post-download integrity validation
+└── test_real_api.py     # Deribit API behavior testing tool
 ```
 
 ## How It Works
@@ -143,4 +168,4 @@ For detailed API behavior (e.g. `has_more` semantics, chunk boundary overlap), s
 
 - **Chunk boundary overlap**: Occasionally Deribit may return 1 overlapping trade at chunk boundaries. This is tolerated — duplicates can be removed during Parquet conversion by `(instrument_name, trade_seq)` dedup.
 - **No-trade instruments**: Some early expired instruments have zero trades and are skipped automatically.
-- **Trade schema**: Future and Option trades share the same 10-field schema (confirmed by real API testing). The Parquet generator uses a broader schema to capture optional fields like `liquidation`, `block_trade_id`, etc.
+- **Trade schema**: Future and Option trades share the same fields (17-field union schema confirmed by real API testing). The Parquet generator uses a comprehensive schema to capture all fields, including rare ones like `liquidation`, `block_trade_id`, `block_rfq_id`, `combo_id`, etc. Missing fields are automatically filled as null.

@@ -10,13 +10,20 @@ from deribit_fetcher.log import setup_logging
 logger = logging.getLogger(__name__)
 
 
-def generate_parquet(data_dir: Path, output_file: Path) -> None:
+def generate_parquet(
+    data_dir: Path,
+    output_file: Path,
+    dedup: bool = True,
+) -> None:
     """
     Scan a directory for JSONL files and merge them into a single Parquet file.
 
     Uses PyArrow's ParquetWriter for streaming write (memory efficient with
     many large input files). A comprehensive schema is applied to ensure all
     optional fields (like liquidation, block_trade_id) are captured uniformly.
+
+    When dedup=True, removes duplicate rows by (instrument_name, trade_seq)
+    both within each JSONL file and across files (handles chunk boundary overlap).
     """
     if not data_dir.exists():
         logger.error(f"Data directory not found: {data_dir}")
@@ -69,6 +76,9 @@ def generate_parquet(data_dir: Path, output_file: Path) -> None:
 
         writer = None
         total_rows = 0
+        total_duplicates = 0
+        # Track seen (instrument, trade_seq) keys across all files for cross-file dedup
+        prev_keys: set[tuple[str, int]] = set()
 
         for f in tqdm(jsonl_files, desc=f"Writing {output_file.name}", unit="file"):
             try:
@@ -77,7 +87,55 @@ def generate_parquet(data_dir: Path, output_file: Path) -> None:
                 if df.is_empty():
                     continue
 
+                if dedup:
+                    # Intra-file dedup: remove duplicates within a single JSONL file
+                    before = len(df)
+                    df = df.unique(
+                        subset=["instrument_name", "trade_seq"], keep="first"
+                    )
+                    intra_dup = before - len(df)
+                    if intra_dup:
+                        logger.debug(f"{f.name}: removed {intra_dup} intra-file dups")
+
+                    # Cross-file dedup: drop rows already seen in earlier files
+                    if prev_keys:
+                        # Build a struct column for is_in comparison
+                        key_struct = pl.struct(
+                            pl.col("instrument_name"),
+                            pl.col("trade_seq").cast(pl.Int64),
+                        )
+                        mask = ~key_struct.is_in(
+                            pl.Series(
+                                "prev",
+                                [
+                                    {"instrument_name": k[0], "trade_seq": k[1]}
+                                    for k in prev_keys
+                                ],
+                            )
+                        )
+                        before = len(df)
+                        df = df.filter(mask)
+                        cross_dup = before - len(df)
+                        if cross_dup:
+                            logger.debug(
+                                f"{f.name}: removed {cross_dup} cross-file dups"
+                            )
+                        total_duplicates += cross_dup
+                    total_duplicates += intra_dup
+
+                    # Record keys from this file for future cross-file checks
+                    new_keys = set(
+                        zip(
+                            df["instrument_name"].to_list(),
+                            (int(v) for v in df["trade_seq"].to_list()),
+                        )
+                    )
+                    prev_keys.update(new_keys)
+
                 total_rows += len(df)
+                if df.is_empty():
+                    continue
+
                 table = df.to_arrow()
 
                 # Initialize PyArrow writer with the schema from the first valid table
@@ -93,7 +151,10 @@ def generate_parquet(data_dir: Path, output_file: Path) -> None:
         if writer:
             writer.close()
 
-        logger.info(f"Successfully loaded {total_rows} rows.")
+        summary = f"Successfully loaded {total_rows} rows"
+        if total_duplicates > 0:
+            summary += f", removed {total_duplicates} duplicates"
+        logger.info(summary)
         logger.info(
             f"Successfully wrote Parquet file: {output_file} "
             f"(Size: {output_file.stat().st_size / (1024 * 1024):.2f} MB)"
@@ -115,6 +176,11 @@ def main() -> None:
         required=True,
         help="Type of data to merge (future or option).",
     )
+    parser.add_argument(
+        "--no-dedup",
+        action="store_true",
+        help="Skip deduplication (faster, but may contain duplicate rows).",
+    )
 
     args = parser.parse_args()
 
@@ -130,7 +196,7 @@ def main() -> None:
     output_file = settings.BASE_DIR / f"{data_type}.parquet"
 
     logger.info(f"Starting Parquet generation for {data_type.upper()} data...")
-    generate_parquet(input_dir, output_file)
+    generate_parquet(input_dir, output_file, dedup=not args.no_dedup)
     logger.info("Done.")
 
 

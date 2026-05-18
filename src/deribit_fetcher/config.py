@@ -6,6 +6,8 @@ from pathlib import Path
 
 @dataclass
 class Config:
+    """Application configuration loaded from environment variables."""
+
     # API
     BASE_URL: str = "https://history.deribit.com/api/v2/public"
     CURRENCY: str = "BTC"
@@ -26,6 +28,7 @@ class Config:
     PROXY: str | None = None
 
     def __post_init__(self):
+        # Resolve proxy from environment (try uppercase and lowercase variants)
         self.PROXY = (
             os.environ.get("HTTP_PROXY")
             or os.environ.get("HTTPS_PROXY")

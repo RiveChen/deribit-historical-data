@@ -3,14 +3,20 @@ from tqdm import tqdm
 
 
 class TqdmLoggingHandler(logging.Handler):
+    """
+    Logging handler compatible with tqdm progress bars.
+
+    Uses tqdm.write() to print log messages, which temporarily pauses the
+    progress bar, prints the message, and redraws the bar — avoiding visual
+    corruption of progress output.
+    """
+
     def __init__(self, level=logging.NOTSET):
         super().__init__(level)
 
     def emit(self, record):
         try:
             msg = self.format(record)
-            # Use tqdm.write instead of print or stream.write
-            # tqdm.write will automatically pause the progress bar, print the message, and then redraw the progress bar
             tqdm.write(msg)
             self.flush()
         except Exception:
@@ -18,8 +24,11 @@ class TqdmLoggingHandler(logging.Handler):
 
 
 def setup_logging():
+    """Configure root logger with tqdm-compatible output and structured formatting."""
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
+
+    # Suppress noisy httpx debug logging
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     if root_logger.handlers:

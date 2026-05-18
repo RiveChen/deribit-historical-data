@@ -19,6 +19,13 @@ TASK_QUEUE_SIZE = 200
 async def _prepare_initial_tasks(
     repo: OptionProgressRepo, deribit_client: DeribitClient, refresh_list: bool = True
 ) -> list[dict]:
+    """
+    Prepare initial fetch tasks for options.
+
+    Unlike futures (pre-allocated chunks), options use a streaming approach:
+    start from last_no + 1 and dynamically enqueue subsequent chunks via
+    the on_success callback.
+    """
     if refresh_list:
         logger.info("Fetching option instrument list...")
         options = await deribit_client.get_instruments(
@@ -49,6 +56,7 @@ async def _prepare_initial_tasks(
 
 
 async def run(stop_event: asyncio.Event):
+    """Main fetch routine for options. Uses streaming chunks via the on_success callback."""
     setup_logging()
 
     async with DatabaseClient(settings.OPTION_DB_PATH) as db_conn:
@@ -70,6 +78,7 @@ async def run(stop_event: asyncio.Event):
             )
 
             async def fetch_chunk(tasking: dict) -> dict:
+                """Fetch a chunk of option trades. Determines whether to continue streaming."""
                 instrument = tasking["instrument"]
                 start_seq = tasking["start_seq"]
                 end_seq = start_seq + settings.CHUNK_SIZE - 1
@@ -91,9 +100,11 @@ async def run(stop_event: asyncio.Event):
 
                 if trades:
                     last_seq_in_chunk = trades[0]["trade_seq"]
+                    # Continue if there's more data in this range or chunk was full
                     if has_more or len(trades) >= settings.CHUNK_SIZE:
                         should_continue = True
 
+                # Only mark finished if the instrument is expired (no more trades will appear)
                 if not should_continue and tasking["is_expired"]:
                     storage_item["finished"] = True
 
@@ -102,6 +113,7 @@ async def run(stop_event: asyncio.Event):
                 return storage_item
 
             async def on_success(tasking: dict, result_item: dict):
+                """Enqueue the next chunk if there's more data to fetch for this option."""
                 if result_item["should_continue"]:
                     next_task = {
                         "instrument": tasking["instrument"],
@@ -112,13 +124,13 @@ async def run(stop_event: asyncio.Event):
                         await engine.task_queue.put(next_task)
 
             def custom_pbar_updater(item: dict, pbar: tqdm):
+                """Update progress bar: increment completed count on finish, expand total on new chunks."""
                 if item.get("finished"):
                     current_done = pbar.postfix
                     finished_count = 0
                     if current_done and isinstance(current_done, dict):
                         finished_count = current_done.get("Done", 0)
                     elif current_done and isinstance(current_done, str):
-                        # Parsing "Done: X" if it was a string
                         try:
                             finished_count = int(current_done.split(":")[1].strip())
                         except Exception:
@@ -131,6 +143,15 @@ async def run(stop_event: asyncio.Event):
                         pbar.refresh()
 
             async def sync_db(buffers: dict[str, list[dict]]):
+                """
+                Write data to disk and update DB progress.
+
+                Write order: disk first, then DB. This is intentional:
+                if a crash happens between flush and DB update, the restart
+                will re-fetch from a slightly older last_no, producing
+                duplicate trades in JSONL — which is tolerable (dedup at
+                Parquet stage). The MAX(last_no, ?) guard prevents rollback.
+                """
                 # Compute DB updates first (pure computation, before any I/O)
                 db_updates = []
                 completed_instruments = []
@@ -156,10 +177,7 @@ async def run(stop_event: asyncio.Event):
                 # Write data to disk first (data durability takes priority)
                 await sink.flush(buffers)
 
-                # Then update DB progress — if crash happens right after flush,
-                # restart re-fetches from old last_no and produces duplicates in JSONL.
-                # This is tolerable (dedup via trade_seq is possible at Parquet stage).
-                # The MAX(last_no, ?) guard in update_option_last_no prevents rollback.
+                # Then update DB progress
                 if db_updates:
                     await repo.update_option_last_no(db_updates)
 
@@ -179,6 +197,7 @@ async def run(stop_event: asyncio.Event):
 
 
 async def main():
+    """Entry point: sets up signal handlers for graceful shutdown and runs the fetcher."""
     shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 

@@ -8,7 +8,9 @@ from pathlib import Path
 class JSONLinesSink:
     """
     A generic sink for writing chunks of JSON data to JSONL files.
-    Operating asynchronously by offloading disk I/O to a thread pool executor.
+
+    Operates asynchronously by offloading disk I/O to a thread pool executor,
+    keeping the event loop responsive during file writes.
     """
 
     def __init__(self, base_dir: Path):
@@ -17,10 +19,10 @@ class JSONLinesSink:
 
     async def flush(self, data_buffers: dict[str, list[dict]]):
         """
-        Flush memory buffers to disk.
-        data_buffers is expected to be a dict mapping:
-            instrument_name -> list of items
-        where each item has a "data" key containing a list of dictionaries (trades/ticks).
+        Flush in-memory buffers to disk.
+
+        data_buffers maps instrument_name -> list of items,
+        where each item has a "data" key containing a list of trade dicts.
         """
         if not data_buffers:
             return
@@ -38,7 +40,7 @@ class JSONLinesSink:
                     with open(file_path, "ab") as f:
                         f.write(b"\n".join(lines) + b"\n")
 
-        # Convert to dict to detach from defaultdict or references that might change
+        # Convert to a plain dict to detach from defaultdict references that might change
         await asyncio.get_running_loop().run_in_executor(
             None, sync_io_task, dict(data_buffers)
         )

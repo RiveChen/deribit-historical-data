@@ -8,6 +8,13 @@ from deribit_fetcher.config import logger
 
 
 class FetcherEngine:
+    """
+    Generic async producer-consumer engine for data fetching workloads.
+
+    Manages a task queue (producers fetch data) and a storage queue (consumer
+    persists results). Supports graceful shutdown via an external stop_event.
+    """
+
     def __init__(
         self,
         worker_count: int,
@@ -27,27 +34,28 @@ class FetcherEngine:
         pbar: tqdm,
         stop_event: asyncio.Event,
     ):
+        """Worker coroutine: pulls tasks from the queue, fetches data, enqueues results for storage."""
         while not stop_event.is_set():
             try:
                 tasking = await asyncio.wait_for(self.task_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
 
+            # None is the poison pill — signals shutdown
             if tasking is None:
                 self.task_queue.task_done()
                 break
 
             try:
-                # fetch_func returns the data item to be stored
                 result_item = await fetch_func(tasking)
 
-                # Execute success callback if defined. Useful for enqueueing next sequences or updating pbar logic
+                # Execute success callback (e.g. enqueue next chunk for streaming fetches)
                 if on_success:
                     await on_success(tasking, result_item)
 
                 await self.storage_queue.put(result_item)
-                
-                # Default behavior: update pbar by 1 for each completed chunk task
+
+                # Default: advance progress bar by one chunk
                 pbar.update(1)
 
             except Exception as e:
@@ -64,6 +72,10 @@ class FetcherEngine:
         pbar: tqdm,
         custom_pbar_updater: Callable[[dict, tqdm], None] | None = None,
     ):
+        """
+        Consumer coroutine: receives result items from producers, batches them
+        in memory, and flushes to storage/DB when the batch fills up.
+        """
         buffers = defaultdict(list)
         total_buffered = 0
 
@@ -73,6 +85,7 @@ class FetcherEngine:
             try:
                 item = await asyncio.wait_for(self.storage_queue.get(), timeout=1.0)
 
+                # None is the poison pill — flush remaining buffered data and exit
                 if item is None:
                     if total_buffered > 0:
                         await sync_db_func(buffers)
@@ -95,6 +108,7 @@ class FetcherEngine:
                 self.storage_queue.task_done()
 
             except asyncio.TimeoutError:
+                # Flush partial buffer on idle timeout (keeps data moving)
                 if total_buffered > 0:
                     await sync_db_func(buffers)
                     buffers.clear()
@@ -111,6 +125,10 @@ class FetcherEngine:
         pbar_desc: str = "Fetching",
         pbar_unit: str = "chunk",
     ):
+        """
+        Run the engine: distribute initial tasks, start producer and consumer
+        workers, and block until all tasks complete or stop_event is set.
+        """
         if not initial_tasks:
             logger.info("No tasks to run.")
             return
@@ -134,6 +152,7 @@ class FetcherEngine:
         ]
 
         try:
+            # Feed initial tasks into the task queue
             for task in initial_tasks:
                 if stop_event.is_set():
                     logger.info("Stop event set during task distribution.")
@@ -145,6 +164,7 @@ class FetcherEngine:
                     except asyncio.TimeoutError:
                         continue
 
+            # Wait for either all tasks to complete, or shutdown signal
             queue_finished = asyncio.create_task(self.task_queue.join())
             stop_signal_task = asyncio.create_task(stop_event.wait())
 
@@ -157,10 +177,12 @@ class FetcherEngine:
                 queue_finished.cancel()
 
         finally:
+            # Cancel all producer workers
             for w in workers:
                 w.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
 
+            # Send poison pill to consumer and wait for it to drain
             try:
                 await asyncio.wait_for(self.storage_queue.put(None), timeout=2.0)
                 await asyncio.wait_for(consumer_task, timeout=10.0)

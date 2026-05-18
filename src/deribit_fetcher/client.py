@@ -12,7 +12,7 @@ from tenacity import (
 from deribit_fetcher.config import settings, logger
 
 
-# 自定义等待策略：优先读取 Deribit 的 Retry-After Header
+# Custom wait strategy: prefer Deribit's Retry-After header, fall back to exponential backoff
 class DeribitRateLimitWait:
     def __init__(self, fallback_wait):
         self.fallback_wait = fallback_wait
@@ -21,17 +21,16 @@ class DeribitRateLimitWait:
         if retry_state.outcome is None:
             return self.fallback_wait(retry_state)
 
-        # 检查最后一次尝试是否是 HTTPStatusError
         exc = retry_state.outcome.exception()
         if isinstance(exc, httpx.HTTPStatusError):
-            # Deribit 在 429 时可能会提供 Retry-After (秒)
+            # Deribit may return Retry-After (seconds) on 429 responses
             retry_after = exc.response.headers.get("Retry-After")
             if retry_after and retry_after.isdigit():
-                wait_time = float(retry_after) + 0.5  # 多加 0.5s 缓冲
+                wait_time = float(retry_after) + 0.5  # Small buffer for safety
                 logger.warning(f"Rate limit hit. Server requested wait: {wait_time}s")
                 return wait_time
 
-        # 如果没有 Header，使用默认的指数退避策略
+        # Fall back to random exponential backoff if no Retry-After header
         return self.fallback_wait(retry_state)
 
 
@@ -43,8 +42,10 @@ RETRY_EXCEPTIONS = (
 
 
 class DeribitClient:
+    """Async HTTP client for the Deribit History API v2."""
+
     def __init__(self):
-        # 1. 严格 RPS 控制器：每秒最多 settings.MAX_RPS 次
+        # Strict RPS limiter: max settings.MAX_RPS requests per second
         self.limiter = AsyncLimiter(settings.MAX_RPS, 1)
         self.client = self._create_client()
         logger.info(f"Deribit client initialized with {settings.MAX_RPS} RPS limit.")
@@ -54,7 +55,7 @@ class DeribitClient:
         return httpx.AsyncClient(
             base_url=settings.BASE_URL,
             proxy=proxy,
-            # 对于 20 RPS，连接池需要稍微放大，防止竞争
+            # For 20 RPS, slightly oversize the connection pool to avoid contention
             limits=httpx.Limits(
                 max_connections=settings.MAX_WORKERS,
                 max_keepalive_connections=20,
@@ -63,10 +64,9 @@ class DeribitClient:
             timeout=httpx.Timeout(60.0, connect=10.0),
         )
 
-    # 2. 增强型重试装饰器
+    # Retry decorator: hybrid strategy — prefer server's Retry-After, else exponential backoff
     @retry(
         retry=retry_if_exception_type(RETRY_EXCEPTIONS),
-        # 混合策略：优先听服务器的，服务器没说就用随机指数退避
         wait=DeribitRateLimitWait(
             fallback_wait=wait_random_exponential(multiplier=1, min=1, max=60)
         ),
@@ -78,11 +78,11 @@ class DeribitClient:
         ),
     )
     async def _fetch(self, endpoint: str, params: dict):
-        # 3. 频率限制控制
+        # Rate-limit gate: acquire token before issuing request
         async with self.limiter:
             response = await self.client.get(endpoint, params=params)
 
-            # 如果是限流，记录剩余权重（Deribit 专属 Header）
+            # Log rate-limit info on 429 (Deribit specific header)
             if response.status_code == 429:
                 limit_reset = response.headers.get("x-ratelimit-reset")
                 logger.error(f"429 Too Many Requests. Reset at: {limit_reset}")
@@ -91,7 +91,9 @@ class DeribitClient:
             return response.json()
 
     async def get_instruments(self, currency: str, kind: str) -> list:
+        """Fetch all instruments (both expired and active) for a given currency and kind."""
         import json
+
         instruments = []
         tasks = []
         for expired in ["true", "false"]:
@@ -103,12 +105,11 @@ class DeribitClient:
             instruments.extend(data["result"])
 
         logger.info(f"Fetched {len(instruments)} {currency} {kind} instruments.")
-        
-        # save to json
+
         save_dir = settings.BASE_DIR / kind
         save_dir.mkdir(parents=True, exist_ok=True)
         save_path = save_dir / "instruments.json"
-        
+
         try:
             with open(save_path, "w", encoding="utf-8") as f:
                 json.dump(instruments, f, indent=2, ensure_ascii=False)
@@ -119,6 +120,7 @@ class DeribitClient:
         return instruments
 
     async def get_last_trade_seq(self, instrument: str) -> int:
+        """Get the latest trade_seq for an instrument. Returns 0 if no trades exist."""
         try:
             params = {"instrument_name": instrument, "count": 1}
             data = await self._fetch("/get_last_trades_by_instrument", params)
@@ -131,6 +133,7 @@ class DeribitClient:
     async def get_trades_chunk(
         self, instrument: str, start_seq: int, end_seq: int
     ) -> tuple[list, bool]:
+        """Fetch a chunk of trades within [start_seq, end_seq]. Returns (trades, has_more)."""
         params = {
             "instrument_name": instrument,
             "start_seq": start_seq,

@@ -17,6 +17,7 @@ TASK_QUEUE_SIZE = 200
 
 
 async def _fetch_all_sequences(incompleted_futures, deribit_client):
+    """Fetch the latest trade_seq for each incomplete future in parallel."""
     tasks = [
         deribit_client.get_last_trade_seq(f["instrument"]) for f in incompleted_futures
     ]
@@ -34,6 +35,13 @@ async def _prepare_tasks(
     refresh_list: bool = True,
     refresh_chunks: bool = True,
 ):
+    """
+    Prepare the task list for fetching.
+
+    1. Upsert the instrument list from the API (if refresh_list)
+    2. Get incomplete futures, fetch their last_seq, pre-allocate chunks (if refresh_chunks)
+    3. Return the list of pending chunks to be fetched
+    """
     if refresh_list:
         futures = await deribit_client.get_instruments(
             currency=settings.CURRENCY, kind="future"
@@ -51,11 +59,13 @@ async def _prepare_tasks(
             incompleted_futures, deribit_client
         )
 
+        # Futures with no trades (last_seq == 0) are marked complete immediately
         no_trade_futures = [f for f in incompleted_futures if f.get("last_seq") == 0]
         for f in no_trade_futures:
             await repo.mark_future_complete(f["instrument"])
         todo_futures = [f for f in incompleted_futures if f.get("last_seq", 0) > 0]
 
+        # Pre-allocate chunks: partition [1, last_seq] into fixed-size ranges
         for f in todo_futures:
             chunks = []
             for i in range(1, f.get("last_seq") + 1, settings.CHUNK_SIZE):
@@ -71,6 +81,7 @@ async def _prepare_tasks(
 
 
 async def run(stop_event: asyncio.Event):
+    """Main fetch routine for futures. Uses a producer-consumer engine for concurrent chunk fetching."""
     setup_logging()
 
     async with DatabaseClient(settings.FUTURE_DB_PATH) as db_conn:
@@ -90,6 +101,7 @@ async def run(stop_event: asyncio.Event):
             )
 
             async def fetch_chunk(tasking: dict) -> dict:
+                """Fetch a single chunk of trades and return it with metadata."""
                 instrument = tasking["instrument"]
                 start_seq = tasking["chunk_no"]
                 end_seq = start_seq + settings.CHUNK_SIZE - 1
@@ -105,6 +117,7 @@ async def run(stop_event: asyncio.Event):
                 }
 
             async def sync_db(buffers: dict[str, list[dict]]):
+                """Flush data to disk and update chunk progress."""
                 await sink.flush(buffers)
                 db_updates = []
                 for items in buffers.values():
@@ -128,12 +141,13 @@ async def run(stop_event: asyncio.Event):
                 pbar_desc="Downloading Trades",
             )
 
-            # Finalize: mark completed chunks and futures so they are skipped on restart
+            # Finalize: mark completed chunks and instruments so they're skipped on restart
             await repo.finalize_chunks()
             await repo.finalize_future_meta()
 
 
 async def main():
+    """Entry point: sets up signal handlers for graceful shutdown and runs the fetcher."""
     shutdown_event = asyncio.Event()
     loop = asyncio.get_running_loop()
 

@@ -196,24 +196,32 @@ params = {
 | `result.trades` | array\[Trade\] | 成交数据数组，**降序排列**（highest seq first） |
 | `result.has_more` | boolean | **范围内是否有更多数据**（非"是否有后续范围"） |
 
-### 4.3 Trade 结构（Future & Option 一致）
+### 4.3 Trade 结构（全部字段 Union）
 
-实测确认 future 和 option 的 trade 字段完全一致（10 个字段）：
+以下 17 个字段是所有成交类型的字段并集。核心 10 个字段始终存在，其余 7 个仅出现在特定交易类型。
 
-| 字段 | 类型 | 示例 | 说明 |
-|------|------|------|------|
-| `trade_seq` | integer | `655` | **成交唯一序号**，单调递增，用于分页 cursor |
-| `trade_id` | string | `"59348"` | 成交 ID |
-| `timestamp` | integer (ms) | `1487318049023` | 成交时间戳（毫秒） |
-| `amount` | float | `6000.0` | 成交数量（合约张数） |
-| `price` | float | `1041.86` | 成交价格 |
-| `direction` | string | `"buy"` / `"sell"` | 主动成交方向 |
-| `tick_direction` | integer | `0`, `1`, `2`, `3` | 价格变动方向标记 |
-| `index_price` | float | `1042.56` | 抓取时的指数价格 |
-| `mark_price` | float \| null | `null` | 抓取时的标记价格（早期数据可能为 null） |
-| `instrument_name` | string | `"BTC-17FEB17"` | 交易对名称 |
+| 字段 | 类型 | 示例 | 出现场景 |
+|------|------|------|---------|
+| `trade_seq` | integer | `655` | **始终存在**。成交唯一序号，单调递增，用于分页 cursor |
+| `trade_id` | string | `"59348"` | **始终存在**。成交 ID |
+| `timestamp` | integer (ms) | `1487318049023` | **始终存在**。成交时间戳（毫秒） |
+| `amount` | float | `6000.0` | **始终存在**。成交数量（合约张数） |
+| `price` | float | `1041.86` | **始终存在**。成交价格 |
+| `direction` | string | `"buy"` / `"sell"` | **始终存在**。主动成交方向 |
+| `tick_direction` | integer | `0`, `1`, `2`, `3` | **始终存在**。价格变动方向标记 |
+| `index_price` | float | `1042.56` | **始终存在**。抓取时的指数价格 |
+| `mark_price` | float \| null | `null` | **始终存在**。抓取时的标记价格（早期数据可能为 null） |
+| `instrument_name` | string | `"BTC-17FEB17"` | **始终存在**。交易对名称 |
+| `contracts` | float | `10.0` | Future 及 Option 均出现，但不适用于某些品种 |
+| `iv` | float | `0.7549` | **仅 Option**。隐含波动率 |
+| `liquidation` | string | `"..."` | **仅永续合约 (perpetual)**。强平标记 |
+| `combo_id` | string | `"BTC-FS-26JUN26_27MAR26"` | **仅组合/价差交易** |
+| `combo_trade_id` | string | `"376192167"` | **仅组合/价差交易** |
+| `block_trade_id` | string | `"..."` | **仅大宗交易 (block trade)** |
+| `block_rfq_id` | string | `"..."` | **仅大宗交易 (block trade)** |
+| `block_trade_leg_count` | integer | `2` | **仅大宗交易 (block trade)**。腿数 |
 
-> **注意**：实测验证 Future 和 Option 的 Trade 结构完全一致，10/10 字段跨成交记录也一致。
+> **注意**：gen_parquet.py 使用以上完整 Union Schema 确保任何种类成交数据被正确读取，缺失字段自动填充为 null。
 
 ---
 

@@ -37,6 +37,10 @@ def generate_parquet(data_dir: Path, output_file: Path) -> None:
         # Define the comprehensive schema of a Deribit Trade.
         # This ensures rare fields are not dropped during schema inference
         # and standardizes the output Parquet schema for all instrument types.
+        # Fields marked with ¹ appear only on specific trade types:
+        #   combo/block-trades → combo_id, combo_trade_id, block_trade_id, block_rfq_id, block_trade_leg_count
+        #   perpetual futures  → liquidation
+        #   options only       → iv, contracts
         comprehensive_schema = pl.Schema(
             {
                 "trade_seq": pl.Int64,
@@ -52,11 +56,11 @@ def generate_parquet(data_dir: Path, output_file: Path) -> None:
                 "amount": pl.Float64,
                 "contracts": pl.Float64,
                 "block_trade_id": pl.String,
+                "block_rfq_id": pl.String,
+                "block_trade_leg_count": pl.Int64,
                 "combo_id": pl.String,
                 "combo_trade_id": pl.String,
-                "fee_currency": pl.String,
                 "liquidation": pl.String,
-                "mmp": pl.Boolean,
             }
         )
 

@@ -82,6 +82,11 @@ def generate_parquet(
 
     When dedup=True, removes duplicate rows by (instrument_name, trade_seq)
     both within each JSONL file and across files (handles chunk boundary overlap).
+
+    Performance note: cross-file dedup uses per-instrument key tracking
+    (dict[str, set[int]]) instead of a flat global set. Since each JSONL file
+    contains trades for exactly one instrument, this avoids O(n) scan over
+    millions of unrelated keys on every file.
     """
     if not data_dir.exists():
         logger.error(f"Data directory not found: {data_dir}")
@@ -106,8 +111,12 @@ def generate_parquet(
         writer = None
         total_rows = 0
         total_duplicates = 0
-        # Track seen (instrument, trade_seq) keys across all files for cross-file dedup
-        prev_keys: set[tuple[str, int]] = set()
+        # Per-instrument key tracking for cross-file dedup.
+        # Keys: dict[instrument_name, set[trade_seq]]
+        # Since each JSONL file corresponds to exactly one instrument,
+        # this avoids O(all_keys) scan on every file — we only check
+        # against the current instrument's set.
+        prev_keys: dict[str, set[int]] = {}
 
         # Phase 1: parallel read + intra-file dedup
         # Phase 2 (main thread): sequential cross-file dedup + write
@@ -130,23 +139,18 @@ def generate_parquet(
                         continue
 
                     if dedup:
-                        # Cross-file dedup: drop rows already seen in earlier files
-                        if prev_keys:
-                            key_struct = pl.struct(
-                                pl.col("instrument_name"),
-                                pl.col("trade_seq").cast(pl.Int64),
-                            )
-                            # implode() creates a List(struct) to avoid ambiguous is_in deprecation
-                            prev_series = pl.Series(
-                                "prev",
-                                [
-                                    {"instrument_name": k[0], "trade_seq": k[1]}
-                                    for k in prev_keys
-                                ],
-                            ).implode()
-                            mask = ~key_struct.is_in(prev_series)
+                        # Cross-file dedup: only check against this instrument's seen keys
+                        # The instrument_name is constant within a single JSONL file
+                        # (one file per instrument), so we can extract it from the first row.
+                        instr_name = df["instrument_name"][0]
+                        seen_seqs = prev_keys.get(instr_name)
+
+                        if seen_seqs:
+                            # Polars idiom: filter out rows whose trade_seq is in seen_seqs
                             before = len(df)
-                            df = df.filter(mask)
+                            df = df.filter(
+                                ~pl.col("trade_seq").cast(pl.Int64).is_in(seen_seqs)
+                            )
                             cross_dup = before - len(df)
                             if cross_dup:
                                 logger.debug(
@@ -155,13 +159,13 @@ def generate_parquet(
                             total_duplicates += cross_dup
 
                         # Record keys from this file for future cross-file checks
-                        new_keys = set(
-                            zip(
-                                df["instrument_name"].to_list(),
-                                (int(v) for v in df["trade_seq"].to_list()),
-                            )
+                        new_seqs = set(
+                            int(v) for v in df["trade_seq"].to_list()
                         )
-                        prev_keys.update(new_keys)
+                        if instr_name in prev_keys:
+                            prev_keys[instr_name].update(new_seqs)
+                        else:
+                            prev_keys[instr_name] = new_seqs
 
                     total_rows += len(df)
                     if df.is_empty():

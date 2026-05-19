@@ -1,8 +1,10 @@
 """
 Post-download data integrity validation.
 
-Only validates generated Parquet files, using Polars LazyFrame (streaming)
-aggregations to avoid OOM on large files (future.parquet ~90 GB).
+Validates generated Parquet files by checking trade_seq continuity for each
+instrument individually. Uses streaming-safe aggregations: group_by on
+~357 instruments produces a tiny hash table, while count/min/max are O(1)
+memory accumulators — safe even on 90 GB files.
 """
 
 import argparse
@@ -19,11 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def validate_parquet(parquet_path: Path) -> None:
-    """Validate a generated parquet file using streaming LazyFrame to avoid OOM.
-
-    Only streaming-safe aggregations are used — no hash-based operations
-    (group_by, unique, struct.n_unique) that would OOM on 90 GB files.
-    """
+    """Validate a generated parquet file, checking each instrument for gaps."""
     if not parquet_path.exists():
         logger.warning(f"Parquet file not found: {parquet_path}")
         return
@@ -34,27 +32,6 @@ def validate_parquet(parquet_path: Path) -> None:
 
     lf = pl.scan_parquet(parquet_path)
 
-    # Streaming aggregations — never materializes the full file.
-    # All these ops are streaming-safe (no hash table needed):
-    #   len, min, max, n_unique
-    stats = (
-        lf.select(
-            [
-                pl.len().alias("count"),
-                pl.min("timestamp").alias("ts_min"),
-                pl.max("timestamp").alias("ts_max"),
-                pl.min("trade_seq").alias("seq_min"),
-                pl.max("trade_seq").alias("seq_max"),
-                pl.col("trade_seq").n_unique().alias("seq_unique"),
-            ]
-        )
-        .collect()
-    )
-
-    rows = int(stats[0, "count"])
-
-    print(f"Rows: {rows:,}")
-
     # Schema info (metadata only — no data scan)
     schema = lf.collect_schema()
     print(f"Columns: {len(schema)}")
@@ -62,38 +39,75 @@ def validate_parquet(parquet_path: Path) -> None:
     for col, dtype in schema.items():
         print(f"  {col:25s}  {str(dtype):12s}")
 
-    # Dedup estimate: if trade_seq is globally unique within the parquet,
-    # seq_unique == count means no duplicates.
-    seq_unique = int(stats[0, "seq_unique"])
-    if rows == seq_unique:
-        print(f"\n✅ Dedup check passed: {rows:,} unique trade_seq values")
-    else:
+    # Per-instrument streaming aggregation.
+    # group_by on ~357 keys is safe (tiny hash table).
+    # count/min/max are O(1) streaming accumulators.
+    instr_stats = (
+        lf.group_by("instrument_name")
+        .agg(
+            [
+                pl.len().alias("count"),
+                pl.min("trade_seq").alias("seq_min"),
+                pl.max("trade_seq").alias("seq_max"),
+            ]
+        )
+        .collect()
+    )
+
+    print(f"\n{'Instrument':35s} {'Rows':>10s} {'Seq Range':>24s} {'Status':20s}")
+    print("-" * 93)
+
+    total_rows = 0
+    ok_count = 0
+    gap_count = 0
+    ts_min_global = None
+    ts_max_global = None
+
+    # Sort by instrument name for deterministic output
+    instr_stats = instr_stats.sort("instrument_name")
+
+    for row in instr_stats.iter_rows():
+        instr, count, seq_min, seq_max = row
+        total_rows += count
+        expected = seq_max - seq_min + 1
+
+        if count < expected:
+            gap = expected - count
+            status = f"⚠️  {gap} gaps"
+            gap_count += 1
+        else:
+            status = "✅"
+            ok_count += 1
+
         print(
-            f"\n⚠️  Found {rows - seq_unique} duplicate trade_seq values "
-            f"({seq_unique:,} unique out of {rows:,})"
+            f"{instr:35s} {count:>10,} {seq_min:>12,}..{seq_max:<12,} {status:20s}"
         )
 
-    # Time range
+    # Global time range
+    ts_stats = (
+        lf.select(
+            [
+                pl.min("timestamp").alias("ts_min"),
+                pl.max("timestamp").alias("ts_max"),
+            ]
+        )
+        .collect()
+    )
     t_min = datetime.fromtimestamp(
-        int(stats[0, "ts_min"]) / 1000, tz=timezone.utc
+        int(ts_stats[0, "ts_min"]) / 1000, tz=timezone.utc
     ).strftime("%Y-%m-%d")
     t_max = datetime.fromtimestamp(
-        int(stats[0, "ts_max"]) / 1000, tz=timezone.utc
+        int(ts_stats[0, "ts_max"]) / 1000, tz=timezone.utc
     ).strftime("%Y-%m-%d")
-    print(f"Time range: {t_min} ~ {t_max}")
-
-    # trade_seq range
-    seq_min = int(stats[0, "seq_min"])
-    seq_max = int(stats[0, "seq_max"])
-    expected = seq_max - seq_min + 1
-    if seq_unique < expected:
-        print(f"Gap estimate: {expected - seq_unique} missing trade_seq values")
-    else:
-        print(f"trade_seq range: {seq_min:,} ~ {seq_max:,} ({expected:,} expected)")
 
     # File size
     size_mb = parquet_path.stat().st_size / (1024 * 1024)
-    print(f"\nFile size: {size_mb:.2f} MB")
+
+    print(f"\n{'=' * 80}")
+    print(f"Total rows: {total_rows:,}")
+    print(f"Files with gaps: {gap_count}    Files OK: {ok_count}")
+    print(f"Time range: {t_min} ~ {t_max}")
+    print(f"File size: {size_mb:.2f} MB")
     print(f"{'=' * 80}")
 
 

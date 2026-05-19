@@ -118,7 +118,7 @@ def validate_jsonl(data_dir: Path) -> None:
         else:
             status = "✅"
 
-        fields = list(lf.collect_schema().columns())
+        fields = list(lf.collect_schema())
         reports.append((instr, rows, t_min, t_max, status, fields))
 
     # Print summary table

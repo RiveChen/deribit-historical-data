@@ -1,11 +1,11 @@
 # Deribit 历史数据爬虫
 
-> 高性能异步爬虫，从 [Deribit History API v2](https://docs.deribit.com/#public-get_last_trades_by_instrument) 下载全部历史成交数据，支持**期货（Future）**和**期权（Option）**。
+> 异步爬虫，从 [Deribit History API v2](https://docs.deribit.com/#public-get_last_trades_by_instrument) 下载全部历史成交数据，支持**期货（Future）**和**期权（Option）**。
 
 ## 功能特点
 
 - **全量历史下载** — 基于 `trade_seq` 分块，下载每一笔成交，而不仅仅是近期数据
-- **异步高性能** — 最高 20 RPS，通过 `asyncio` 可配置并发数
+- **异步** — 最高 20 RPS（受 API 限制），通过 `asyncio` 可配置并发数
 - **断点续传** — SQLite 检查点数据库记录进度，部分下载可从中断处恢复
 - **优雅关闭** — 处理 `SIGINT`/`SIGTERM` 信号，保留已收集的全部数据
 - **JSONL 输出** — 原始数据保存为换行符分隔的 JSON，每行一笔成交
@@ -72,7 +72,7 @@ uv run python -m deribit_fetcher.option
 
 ### 3. 导出为 Parquet
 
-Parquet 生成器将所有 JSONL 文件合并为单个压缩 Parquet 文件，支持去重。
+Parquet 生成器将所有 JSONL 文件合并为单个压缩 Parquet 文件，支持去重。JSONL 源文件不会被删除，只会额外生成 `.parquet` 文件，因此需要同时容纳原始 JSONL 和生成的 Parquet 的磁盘空间（例如，截至 2026 年 5 月数据量：期权约 10 GB，期货约 90 GB）。
 
 ```bash
 # 将所有 BTC 期货 JSONL 合并为单个 Parquet
@@ -81,9 +81,24 @@ uv run python scripts/gen_parquet.py --type future
 # 将所有 BTC 期权 JSONL 合并
 uv run python scripts/gen_parquet.py --type option
 
+# 使用 lz4 压缩（更快，文件略大约 10-15%）
+uv run python scripts/gen_parquet.py --type future --fast
+
+# 并行块处理（默认使用所有 CPU 核心）
+uv run python scripts/gen_parquet.py --type future --stream-workers 8
+
 # 跳过去重（速度更快，但可能包含重复行）
 uv run python scripts/gen_parquet.py --type future --no-dedup
 ```
+
+生成器采用两阶段策略：
+- **小文件**（<100 MB，典型期权）：使用线程池并行处理
+- **大文件**（>=100 MB，典型永续合约）：按 `\n` 对齐的字节块切割，使用进程池并行处理（`--stream-workers`），通过饱和磁盘队列深度达到接近 SSD 极限的读取速度。单线程回退模式（`--stream-workers 1`）使用 mmap 零拷贝分批读取。
+
+性能调优建议：
+- 对于单个大文件：`--stream-workers <N>` 默认使用所有 CPU 核心
+- 可调整块大小：`--block-bytes 268435456`（默认 256 MB，越小粒度越细）
+- 用空间换速度：`--fast`（lz4 替代 zstd，文件大约 10-15%）
 
 ### 4. 数据校验
 

@@ -1,6 +1,6 @@
 [project]
 name = "deribit-fetcher"
-version = "0.0.1"
+version = "0.1.0"
 description = "Fetching Deribit historical trades(transactions) via Deribit Historical API."
 readme = "README.md"
 authors = [

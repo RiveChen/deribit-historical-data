@@ -115,7 +115,9 @@ def _read_and_dedup_file(
 def _stream_batches(
     f: Path,
     batch_size: int = _BATCH_SIZE,
-) -> Generator[tuple[str, pl.DataFrame, int, str, set[int]], None, None]:
+) -> Generator[
+    tuple[str, pl.DataFrame, int, str, set[int], int], None, None
+]:
     """
     Stream-read a **large** JSONL file (`f`) in fixed-size batches.
 
@@ -124,7 +126,9 @@ def _stream_batches(
     cross-file dedup via the shared ``prev_keys`` dict — this avoids loading
     the entire file into memory at once.
 
-    Yields (filename, df, intra_dup_count, instrument_name, seq_set).
+    Yields (filename, df, intra_dup_count, instrument_name, seq_set, pos).
+    ``pos`` is the current file position in bytes (from ``fh.tell()``),
+    useful for driving per-file byte-level progress bars.
     """
     lines: list[str] = []
     batch_id = 0
@@ -160,13 +164,13 @@ def _stream_batches(
                 result = _parse()
                 if result:
                     df, intra, instr, seqs = result
-                    yield (f.name, df, intra, instr, seqs)
+                    yield (f.name, df, intra, instr, seqs, fh.tell())
 
         # tail
         result = _parse()
         if result:
             df, intra, instr, seqs = result
-            yield (f.name, df, intra, instr, seqs)
+            yield (f.name, df, intra, instr, seqs, fh.tell())
 
 
 # ---------------------------------------------------------------------------
@@ -315,15 +319,21 @@ def generate_parquet(
                 unit="file",
             ) as pbar:
                 for f in large_files:
-                    size_mb = f.stat().st_size / (1024 * 1024)
-                    logger.info(
-                        f"  Streaming {f.name} ({size_mb:.1f} MB)…"
-                    )
-                    for fname, df, intra, instr, seqs in _stream_batches(
-                        f, stream_batch_size
-                    ):
-                        _consume(fname, df, intra, instr, seqs)
-                        # For progress we treat each large file as one unit.
+                    file_size = f.stat().st_size
+                    with tqdm(
+                        total=file_size,
+                        unit="B",
+                        unit_scale=True,
+                        desc=f.name,
+                        leave=False,
+                    ) as inner_pbar:
+                        last_pos = 0
+                        for fname, df, intra, instr, seqs, pos in _stream_batches(
+                            f, stream_batch_size
+                        ):
+                            _consume(fname, df, intra, instr, seqs)
+                            inner_pbar.update(pos - last_pos)
+                            last_pos = pos
                     processed_count += 1
                     pbar.update(1)
 

@@ -1,19 +1,14 @@
 """
 Post-download data integrity validation.
 
-Checks:
-  1. For each instrument: trade_seq continuity (no gaps)
-  2. Time range coverage (earliest ~ latest timestamp)
-  3. Row count sanity check vs predicted last_seq
-  4. Per-instrument statistics report
+All file reads use Polars LazyFrame (streaming) to avoid OOM on large files
+(e.g. BTC-PERPETUAL.jsonl ~several GB, future.parquet ~90 GB).
 """
 
 import argparse
-import asyncio
-import json
 import logging
-import sqlite3
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import polars as pl
@@ -50,12 +45,11 @@ logger = logging.getLogger(__name__)
 
 def validate_jsonl(data_dir: Path) -> None:
     """
-    Validate all JSONL files in data_dir.
+    Validate all JSONL files in data_dir using streaming LazyFrame queries.
 
     For each instrument file:
       - Count rows
-      - Check trade_seq order (should be descending within each chunk)
-      - Check for gaps in trade_seq (expect no gaps since chunks are contiguous)
+      - Check trade_seq continuity (no gaps)
       - Report time range
     """
     jsonl_files = sorted(data_dir.glob("*.jsonl"))
@@ -74,19 +68,33 @@ def validate_jsonl(data_dir: Path) -> None:
 
     for f in jsonl_files:
         instr = f.stem
-        df = pl.read_ndjson(f, schema=_TRADE_SCHEMA)
-        if df.is_empty():
+
+        # Streaming scan — never loads the full file into memory
+        lf = pl.scan_ndjson(f, schema=_TRADE_SCHEMA)
+
+        stats = (
+            lf.select(
+                [
+                    pl.len().alias("count"),
+                    pl.min("timestamp").alias("ts_min"),
+                    pl.max("timestamp").alias("ts_max"),
+                    pl.min("trade_seq").alias("seq_min"),
+                    pl.max("trade_seq").alias("seq_max"),
+                    pl.col("trade_seq").n_unique().alias("seq_unique"),
+                ]
+            )
+            .collect()
+        )
+
+        if stats.is_empty() or stats[0, "count"] == 0:
             reports.append((instr, 0, "N/A", "N/A", "-"))
             continue
 
-        rows = len(df)
+        rows = int(stats[0, "count"])
         total_rows += rows
 
-        # Timestamp range
-        ts_min = df["timestamp"].min()
-        ts_max = df["timestamp"].max()
-        from datetime import datetime, timezone
-
+        ts_min = stats[0, "ts_min"]
+        ts_max = stats[0, "ts_max"]
         t_min = datetime.fromtimestamp(ts_min / 1000, tz=timezone.utc).strftime(
             "%Y-%m-%d"
         )
@@ -94,31 +102,23 @@ def validate_jsonl(data_dir: Path) -> None:
             "%Y-%m-%d"
         )
 
-        # trade_seq analysis
-        seqs = df["trade_seq"].to_list()
-        seqs.sort()
-        unique_seqs = sorted(set(seqs))
-
-        total_unique = len(unique_seqs)
-        total_raw = len(seqs)
-        duplicates = total_raw - total_unique
-        min_seq = unique_seqs[0]
-        max_seq = unique_seqs[-1]
+        min_seq = int(stats[0, "seq_min"])
+        max_seq = int(stats[0, "seq_max"])
+        unique_seqs = int(stats[0, "seq_unique"])
         expected_count = max_seq - min_seq + 1
 
-        if total_unique < expected_count:
-            gaps = expected_count - total_unique
+        if unique_seqs < expected_count:
+            gaps = expected_count - unique_seqs
             status = f"⚠️  {gaps} gaps"
             total_with_gaps += 1
-        elif duplicates > 0:
+        elif unique_seqs < rows:
+            duplicates = rows - unique_seqs
             status = f"⚠️  {duplicates} dup(s)"
             total_with_overlaps += 1
         else:
             status = "✅"
 
-        # fields present
-        fields = list(df.columns)
-
+        fields = list(lf.collect_schema().columns())
         reports.append((instr, rows, t_min, t_max, status, fields))
 
     # Print summary table
@@ -141,7 +141,7 @@ def validate_jsonl(data_dir: Path) -> None:
         instr = r[0]
         for f in r[5]:
             all_fields.add(f)
-            field_sources[f].add(instr.split("-")[0])  # BTC or ETH prefix
+            field_sources[f].add(instr.split("-")[0])
 
     print(f"\nFields ({len(all_fields)}):")
     for f in sorted(all_fields):
@@ -150,7 +150,7 @@ def validate_jsonl(data_dir: Path) -> None:
 
 
 def validate_parquet(parquet_path: Path) -> None:
-    """Validate a generated parquet file (after dedup)."""
+    """Validate a generated parquet file using streaming LazyFrame to avoid OOM."""
     if not parquet_path.exists():
         logger.warning(f"Parquet file not found: {parquet_path}")
         return
@@ -159,42 +159,80 @@ def validate_parquet(parquet_path: Path) -> None:
     print(f"Validating Parquet: {parquet_path}")
     print(f"{'=' * 80}")
 
-    df = pl.read_parquet(parquet_path)
-    rows = len(df)
+    lf = pl.scan_parquet(parquet_path)
+
+    # Streaming aggregations — never materializes the full file
+    stats = (
+        lf.select(
+            [
+                pl.len().alias("count"),
+                pl.min("timestamp").alias("ts_min"),
+                pl.max("timestamp").alias("ts_max"),
+                pl.col("instrument_name").n_unique().alias("n_instruments"),
+            ]
+        )
+        .collect()
+    )
+
+    rows = int(stats[0, "count"])
+    del stats
 
     print(f"Rows: {rows:,}")
-    print(f"Columns: {len(df.columns)}")
-    print(f"Schema:")
-    for col, dtype in df.schema.items():
-        nulls = df[col].null_count()
-        non_null = rows - nulls
-        print(f"  {col:25s}  {str(dtype):12s}  {non_null:>12,} non-null")
 
-    # Check dedup effectiveness (should be no duplicates by instrument + trade_seq)
-    before = rows
-    after = df.unique(subset=["instrument_name", "trade_seq"]).height
-    if before == after:
+    # Schema info
+    schema = lf.collect_schema()
+    print(f"Columns: {len(schema)}")
+    print(f"Schema:")
+    for col, dtype in schema.items():
+        print(f"  {col:25s}  {str(dtype):12s}")
+
+    # Check dedup effectiveness via streaming unique
+    dedup_check = (
+        lf.select(
+            pl.struct(["instrument_name", "trade_seq"])
+            .alias("pair")
+            .n_unique()
+        )
+        .collect()
+    )
+    unique_pairs = int(dedup_check[0, "pair"])
+    if rows == unique_pairs:
         print(
-            f"\n✅ Dedup check passed: {before:,} unique (instrument, trade_seq) pairs"
+            f"\n✅ Dedup check passed: {rows:,} unique (instrument, trade_seq) pairs"
         )
     else:
         print(
-            f"\n⚠️  Found {before - after} duplicate (instrument, trade_seq) rows remaining"
+            f"\n⚠️  Found {rows - unique_pairs} duplicate (instrument, trade_seq) rows remaining"
         )
 
     # Time range
-    ts_min = df["timestamp"].min()
-    ts_max = df["timestamp"].max()
-    from datetime import datetime, timezone
-
-    t_min = datetime.fromtimestamp(ts_min / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-    t_max = datetime.fromtimestamp(ts_max / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    ts_stats = (
+        lf.select(
+            [
+                pl.min("timestamp").alias("ts_min"),
+                pl.max("timestamp").alias("ts_max"),
+            ]
+        )
+        .collect()
+    )
+    t_min = datetime.fromtimestamp(
+        int(ts_stats[0, "ts_min"]) / 1000, tz=timezone.utc
+    ).strftime("%Y-%m-%d")
+    t_max = datetime.fromtimestamp(
+        int(ts_stats[0, "ts_max"]) / 1000, tz=timezone.utc
+    ).strftime("%Y-%m-%d")
     print(f"Time range: {t_min} ~ {t_max}")
 
-    # Instrument counts
-    instr_counts = df.group_by("instrument_name").len().sort("len", descending=True)
+    # Top instruments (limited to 10 rows via head, streaming-friendly)
+    instr_counts = (
+        lf.group_by("instrument_name")
+        .len()
+        .sort("len", descending=True)
+        .head(10)
+        .collect()
+    )
     print(f"\nTop 10 instruments by row count:")
-    for row in instr_counts.head(10).iter_rows():
+    for row in instr_counts.iter_rows():
         print(f"  {row[0]:35s}  {row[1]:>12,}")
 
     # File size

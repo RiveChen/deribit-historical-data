@@ -20,6 +20,7 @@ import polars as pl
 
 from deribit_fetcher.config import settings
 from deribit_fetcher.log import setup_logging
+from scripts.gen_parquet import COMPREHENSIVE_SCHEMA
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ def validate_jsonl(data_dir: Path) -> None:
 
     for f in jsonl_files:
         instr = f.stem
-        df = pl.read_ndjson(f)
+        df = pl.read_ndjson(f, schema=COMPREHENSIVE_SCHEMA)
         if df.is_empty():
             reports.append((instr, 0, "N/A", "N/A", "-"))
             continue

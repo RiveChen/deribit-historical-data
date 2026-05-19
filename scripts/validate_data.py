@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import polars as pl
+from tqdm import tqdm
 
 from deribit_fetcher.config import settings
 from deribit_fetcher.log import setup_logging
@@ -66,7 +67,7 @@ def validate_jsonl(data_dir: Path) -> None:
     total_with_overlaps = 0
     reports = []
 
-    for f in jsonl_files:
+    for f in tqdm(jsonl_files, desc=f"Validating {data_dir.name}", unit="file"):
         instr = f.stem
 
         # Streaming scan — never loads the full file into memory

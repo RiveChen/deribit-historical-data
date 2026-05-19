@@ -52,7 +52,7 @@ def validate_parquet(parquet_path: Path) -> None:
                 pl.max("timestamp").alias("ts_max"),
             ]
         )
-        .collect(streaming=True)
+        .collect(engine="streaming")
     )
 
     print(f"\n{'Instrument':35s} {'Rows':>10s} {'Seq Range':>24s} {'Status':20s}")

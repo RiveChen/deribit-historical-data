@@ -2,15 +2,19 @@
 Merge Deribit JSONL files into a single Parquet file with parallel reading,
 intra-file dedup in workers, and streaming cross-file dedup in the main thread.
 
-Performance characteristics (measured on WSL / CPU-bound workloads):
-- Bottleneck is CPU (zstd compression + Python set construction from to_list()).
-- Disk I/O rarely stalls (wai < 2% in typical runs).
-- Use --fast to trade ~15% file size for ~20% lower CPU (lz4 vs zstd).
+Performance characteristics:
+- Small files (<100 MB, typical option data): thread-pool parallel, one file per worker.
+- Large files (>=100 MB, typical perpetual futures): stream-read in batches in the
+  main thread to avoid OOM and thread-pool starvation.
+- Bottleneck (small files): CPU (zstd compression); use --fast for lz4.
+- Bottleneck (large files): NDJSON line-by-line parsing; mitigated by streaming batches.
 """
 import argparse
+import io
 import logging
 import os
 import concurrent.futures
+from collections.abc import Generator
 from pathlib import Path
 
 import polars as pl
@@ -22,13 +26,13 @@ from deribit_fetcher.log import setup_logging
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Schema
+# ---------------------------------------------------------------------------
+
 # Comprehensive schema of a Deribit Trade.
 # This ensures rare fields are not dropped during schema inference
 # and standardizes the output Parquet schema for all instrument types.
-# Fields marked with ¹ appear only on specific trade types:
-#   combo/block-trades → combo_id, combo_trade_id, block_trade_id, block_rfq_id, block_trade_leg_count
-#   perpetual futures  → liquidation
-#   options only       → iv, contracts
 COMPREHENSIVE_SCHEMA = pl.Schema(
     {
         "trade_seq": pl.Int64,
@@ -52,11 +56,22 @@ COMPREHENSIVE_SCHEMA = pl.Schema(
     }
 )
 
+# ---------------------------------------------------------------------------
+# Tunables
+# ---------------------------------------------------------------------------
+
 # Accumulate this many Arrow rows before flushing a Row Group.
-# Tuned to balance writer overhead vs memory: 200k rows × ~200 bytes ≈ 40 MB per batch.
+# 200k rows × ~200 bytes ≈ 40 MB per batch.
 _BATCH_SIZE = 200_000
 # Hard cap on pending tables to avoid OOM on giant single files.
 _MAX_PENDING_TABLES = 50
+# Files larger than this (in bytes) are processed via streaming batches
+# instead of being loaded entirely into memory by a thread-pool worker.
+_LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100 MB
+
+# ---------------------------------------------------------------------------
+# Worker: small files  (thread pool)
+# ---------------------------------------------------------------------------
 
 
 def _read_and_dedup_file(
@@ -65,13 +80,12 @@ def _read_and_dedup_file(
     """
     Read a single JSONL file, apply intra-file dedup, and extract dedup keys.
 
-    Runs in a thread pool worker to offload CPU work from the main thread:
-      - NDJSON parsing (Polars, Rust, no GIL)
-      - intra-file unique()
-      - key set construction via to_list() (pure Python, worker thread absorbs GIL cost)
+    Designed for **small-to-medium files** (<100 MB).  Runs in a thread pool
+    worker to offload CPU work: NDJSON parsing (Rust, no GIL), intra-file
+    unique(), and key set construction (pure Python, absorbed by worker).
 
-    Returns (filename, df_or_None, intra_dup_count, instrument_name_or_None, seq_set_or_None).
-    Returns df=None if the file is empty or errored.
+    Returns (filename, df_or_None, intra_dup_count, instrument_name_or_None,
+             seq_set_or_None).
     """
     try:
         df = pl.read_ndjson(f, schema=COMPREHENSIVE_SCHEMA)
@@ -84,7 +98,6 @@ def _read_and_dedup_file(
         if intra_dup:
             logger.debug(f"{f.name}: removed {intra_dup} intra-file dups")
 
-        # Extract keys in the worker thread to avoid Python loop in the main thread
         instr_name = str(df["instrument_name"][0])
         seq_set = set(int(v) for v in df["trade_seq"].to_list())
 
@@ -94,44 +107,120 @@ def _read_and_dedup_file(
         return (f.name, None, 0, None, None)
 
 
+# ---------------------------------------------------------------------------
+# Worker: large files  (streaming, main thread)
+# ---------------------------------------------------------------------------
+
+
+def _stream_batches(
+    f: Path,
+    batch_size: int = _BATCH_SIZE,
+) -> Generator[tuple[str, pl.DataFrame, int, str, set[int]], None, None]:
+    """
+    Stream-read a **large** JSONL file (`f`) in fixed-size batches.
+
+    Each batch is parsed via ``pl.read_ndjson`` and intra-batch deduplicated.
+    The caller (``generate_parquet``) is responsible for cross-batch and
+    cross-file dedup via the shared ``prev_keys`` dict — this avoids loading
+    the entire file into memory at once.
+
+    Yields (filename, df, intra_dup_count, instrument_name, seq_set).
+    """
+    lines: list[str] = []
+    batch_id = 0
+
+    def _parse() -> tuple[pl.DataFrame, int, str, set[int]] | None:
+        nonlocal lines, batch_id
+        if not lines:
+            return None
+        text = "\n".join(lines)
+        lines.clear()
+        df = pl.read_ndjson(io.StringIO(text), schema=COMPREHENSIVE_SCHEMA)
+        if df.is_empty():
+            return None
+        before = len(df)
+        df = df.unique(subset=["instrument_name", "trade_seq"], keep="first")
+        intra_dup = before - len(df)
+        if intra_dup:
+            logger.debug(
+                f"{f.name}[batch {batch_id}]: removed {intra_dup} intra-batch dups"
+            )
+        instr_name = str(df["instrument_name"][0])
+        seqs = set(int(v) for v in df["trade_seq"].to_list())
+        batch_id += 1
+        return (df, intra_dup, instr_name, seqs)
+
+    with f.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            lines.append(line)
+            if len(lines) >= batch_size:
+                result = _parse()
+                if result:
+                    df, intra, instr, seqs = result
+                    yield (f.name, df, intra, instr, seqs)
+
+        # tail
+        result = _parse()
+        if result:
+            df, intra, instr, seqs = result
+            yield (f.name, df, intra, instr, seqs)
+
+
+# ---------------------------------------------------------------------------
+# Main orchestrator
+# ---------------------------------------------------------------------------
+
+
 def generate_parquet(
     data_dir: Path,
     output_file: Path,
     dedup: bool = True,
     workers: int = 4,
     fast: bool = False,
+    large_file_threshold: int = _LARGE_FILE_THRESHOLD,
+    stream_batch_size: int = _BATCH_SIZE,
 ) -> None:
     """
     Scan a directory for JSONL files and merge them into a single Parquet file.
 
-    Uses a two-phase pipeline:
-      Phase 1 (ThreadPool, N workers): parallel NDJSON parsing + intra-file dedup + key extraction.
-      Phase 2 (main thread, sequential): cross-file dedup + batch write.
+    **Routing logic** (based on file size):
+      1. Files >= *large_file_threshold* bytes are stream-read in fixed-size
+         batches by the main thread (``_stream_batches``).  This avoids OOM
+         and keeps memory O(batch_size) regardless of file size.
+      2. Smaller files are dispatched to a ``ThreadPoolExecutor`` for parallel
+         NDJSON parsing.
 
-    When dedup=True, removes duplicate rows by (instrument_name, trade_seq)
-    both within each JSONL file and across files (handles chunk boundary overlap).
-
-    Performance note: cross-file dedup uses per-instrument key tracking
-    (dict[str, set[int]]) instead of a flat global set. Since each JSONL file
-    contains trades for exactly one instrument, this avoids O(n) scan over
-    millions of unrelated keys on every file.
+    All results flow through the same cross-file dedup + batched PyArrow write
+    pipeline in the main thread.
     """
     if not data_dir.exists():
         logger.error(f"Data directory not found: {data_dir}")
         return
 
-    jsonl_files = list(data_dir.glob("*.jsonl"))
-    if not jsonl_files:
+    all_files = list(data_dir.glob("*.jsonl"))
+    if not all_files:
         logger.warning(f"No JSONL files found in {data_dir}")
         return
 
-    n_files = len(jsonl_files)
-    effective_workers = min(workers, n_files)
+    # Split by size
+    large_files = [f for f in all_files if f.stat().st_size >= large_file_threshold]
+    small_files = [f for f in all_files if f.stat().st_size < large_file_threshold]
+    n_total = len(all_files)
+    n_large = len(large_files)
+    n_small = len(small_files)
+    effective_workers = min(workers, n_small) if n_small > 0 else 0
     compression = "lz4" if fast else "zstd"
-    logger.info(f"Found {n_files} JSONL files in {data_dir}")
+
+    logger.info(f"Found {n_total} JSONL files in {data_dir}")
     logger.info(
-        f"Merging into {output_file}... "
-        f"(workers={effective_workers}, compression={compression})"
+        f"  – {n_small} small files  → thread pool ({effective_workers} workers)"
+    )
+    logger.info(f"  – {n_large} large files → stream batches ({stream_batch_size} rows)")
+    logger.info(
+        f"Merging into {output_file}... (compression={compression})"
     )
 
     # Ensure output directory exists
@@ -140,15 +229,17 @@ def generate_parquet(
     try:
         from tqdm import tqdm
 
-        writer = None
+        writer: pq.ParquetWriter | None = None
         total_rows = 0
         total_duplicates = 0
-        # Per-instrument key tracking for cross-file dedup.
+        # Per-instrument key tracking for cross-file (and cross-batch) dedup.
         prev_keys: dict[str, set[int]] = {}
-        # Pending Arrow tables for batched write
+        # Pending Arrow tables for batched write.
         pending: list[pa.Table] = []
+        # Track progress across both phases.
+        processed_count = 0
 
-        def _flush_pending():
+        def _flush_pending() -> None:
             """Write accumulated pending tables as a single Row Group."""
             nonlocal pending
             if not pending:
@@ -157,82 +248,117 @@ def generate_parquet(
             writer.write_table(combined)  # type: ignore[union-attr]
             pending.clear()
 
-        # Phase 1: parallel read + intra-file dedup + key extraction
-        # Phase 2 (main thread): sequential cross-file dedup + batch write
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=effective_workers
-        ) as executor:
-            futures = {
-                executor.submit(_read_and_dedup_file, f): f for f in jsonl_files
-            }
+        def _init_writer(table: pa.Table) -> None:
+            """Lazily initialise the ParquetWriter on first table."""
+            nonlocal writer
+            if writer is None:
+                writer = pq.ParquetWriter(
+                    output_file, table.schema, compression=compression
+                )
 
-            with tqdm(
-                total=n_files, desc=f"Writing {output_file.name}", unit="file"
-            ) as pbar:
-                for future in concurrent.futures.as_completed(futures):
-                    fname, df, intra_dup, instr_name, seq_set = future.result()
-                    total_duplicates += intra_dup
+        def _consume(
+            fname: str,
+            df: pl.DataFrame,
+            intra_dup: int,
+            instr_name: str | None,
+            seq_set: set[int] | None,
+        ) -> None:
+            """Shared result handler: cross-dedup → to_arrow → pending."""
+            nonlocal total_rows, total_duplicates
+            total_duplicates += intra_dup
 
-                    if df is None or df.is_empty():
-                        pbar.update(1)
-                        continue
+            if df is None or df.is_empty():
+                return
 
-                    if dedup and instr_name is not None and seq_set is not None:
-                        # Cross-file dedup: only check against this instrument's seen keys
-                        seen_seqs = prev_keys.get(instr_name)
-
-                        if seen_seqs:
-                            before = len(df)
-                            df = df.filter(
-                                ~pl.col("trade_seq")
-                                .cast(pl.Int64)
-                                .is_in(seen_seqs)
-                            )
-                            cross_dup = before - len(df)
-                            if cross_dup:
-                                logger.debug(
-                                    f"{fname}: removed {cross_dup} cross-file dups"
-                                )
-                            total_duplicates += cross_dup
-
-                        # Record keys (already unioned inside the worker)
-                        if instr_name in prev_keys:
-                            prev_keys[instr_name].update(seq_set)
-                        else:
-                            prev_keys[instr_name] = seq_set
-
-                    total_rows += len(df)
-                    if df.is_empty():
-                        pbar.update(1)
-                        continue
-
-                    table = df.to_arrow()
-
-                    # Initialize PyArrow writer with the schema from the first valid table
-                    if writer is None:
-                        writer = pq.ParquetWriter(
-                            output_file,
-                            table.schema,
-                            compression=compression,
+            if dedup and instr_name is not None and seq_set is not None:
+                seen_seqs = prev_keys.get(instr_name)
+                if seen_seqs:
+                    before = len(df)
+                    df = df.filter(
+                        ~pl.col("trade_seq").cast(pl.Int64).is_in(seen_seqs)
+                    )
+                    cross_dup = before - len(df)
+                    if cross_dup:
+                        logger.debug(
+                            f"{fname}: removed {cross_dup} cross-file dups"
                         )
+                    total_duplicates += cross_dup
 
-                    pending.append(table)
+                # Update instrument key set.
+                if instr_name in prev_keys:
+                    prev_keys[instr_name].update(seq_set)
+                else:
+                    prev_keys[instr_name] = seq_set
 
-                    # Flush when accumulated rows or table count exceeds thresholds
-                    if (
-                        sum(len(t) for t in pending) >= _BATCH_SIZE
-                        or len(pending) >= _MAX_PENDING_TABLES
+            total_rows += len(df)
+            if df.is_empty():
+                return
+
+            table = df.to_arrow()
+            _init_writer(table)
+            pending.append(table)
+
+            if (
+                sum(len(t) for t in pending) >= _BATCH_SIZE
+                or len(pending) >= _MAX_PENDING_TABLES
+            ):
+                _flush_pending()
+
+        # ═══════════════════════════════════════════════════════════════
+        # Phase 1 — large files (streaming, main thread)
+        # ═══════════════════════════════════════════════════════════════
+        if large_files:
+            logger.info("Phase 1/2: streaming large files…")
+            with tqdm(
+                total=n_large,
+                desc=f"Streaming {output_file.name}",
+                unit="file",
+            ) as pbar:
+                for f in large_files:
+                    size_mb = f.stat().st_size / (1024 * 1024)
+                    logger.info(
+                        f"  Streaming {f.name} ({size_mb:.1f} MB)…"
+                    )
+                    for fname, df, intra, instr, seqs in _stream_batches(
+                        f, stream_batch_size
                     ):
-                        _flush_pending()
-
+                        _consume(fname, df, intra, instr, seqs)
+                        # For progress we treat each large file as one unit.
+                    processed_count += 1
                     pbar.update(1)
 
-        # Flush remaining tables
+        # ═══════════════════════════════════════════════════════════════
+        # Phase 2 — small files (thread pool)
+        # ═══════════════════════════════════════════════════════════════
+        if small_files:
+            logger.info("Phase 2/2: processing small files in parallel…")
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=effective_workers
+            ) as executor:
+                futures = {
+                    executor.submit(_read_and_dedup_file, f): f
+                    for f in small_files
+                }
+
+                with tqdm(
+                    total=n_small,
+                    desc=f"Writing {output_file.name}",
+                    unit="file",
+                ) as pbar:
+                    for future in concurrent.futures.as_completed(futures):
+                        result = future.result()
+                        _consume(*result)
+                        processed_count += 1
+                        pbar.update(1)
+
+        # ═══════════════════════════════════════════════════════════════
+        # Flush & finalise
+        # ═══════════════════════════════════════════════════════════════
         if writer is not None:
             _flush_pending()
             writer.close()
 
-        summary = f"Successfully loaded {total_rows} rows"
+        summary = f"Successfully loaded {total_rows} rows from {processed_count} files"
         if total_duplicates > 0:
             summary += f", removed {total_duplicates} duplicates"
         logger.info(summary)
@@ -241,8 +367,13 @@ def generate_parquet(
             f"(Size: {output_file.stat().st_size / (1024 * 1024):.2f} MB)"
         )
 
-    except Exception as e:
-        logger.exception(f"Failed to generate parquet: {e}")
+    except Exception:
+        logger.exception("Failed to generate parquet")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def main() -> None:
@@ -266,13 +397,24 @@ def main() -> None:
         "--workers",
         type=int,
         default=os.cpu_count() or 4,
-        help=f"Number of parallel read workers (default: {os.cpu_count() or 4}, capped by file count).",
+        help=f"Thread-pool workers for small files (default: {os.cpu_count() or 4}).",
     )
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Trade ~10-15%% larger Parquet for ~20%% lower CPU (lz4 instead of zstd)."
-        "  Recommended when CPU is the bottleneck.",
+        help="Trade ~10-15%% larger Parquet for ~20%% lower CPU (lz4 instead of zstd).",
+    )
+    parser.add_argument(
+        "--large-threshold-mb",
+        type=float,
+        default=100.0,
+        help="Files larger than this (MB) are streamed to avoid OOM (default: 100).",
+    )
+    parser.add_argument(
+        "--stream-batch-size",
+        type=int,
+        default=_BATCH_SIZE,
+        help=f"Rows per streaming batch for large files (default: {_BATCH_SIZE}).",
     )
 
     args = parser.parse_args()
@@ -280,7 +422,7 @@ def main() -> None:
     setup_logging()
 
     data_type = args.type
-
+    input_dir: Path
     if data_type == "future":
         input_dir = settings.DATA_FUTURE_DIR
     else:
@@ -288,13 +430,15 @@ def main() -> None:
 
     output_file = settings.BASE_DIR / f"{data_type}.parquet"
 
-    logger.info(f"Starting Parquet generation for {data_type.upper()} data...")
+    logger.info(f"Starting Parquet generation for {data_type.upper()} data…")
     generate_parquet(
-        input_dir,
-        output_file,
+        data_dir=input_dir,
+        output_file=output_file,
         dedup=not args.no_dedup,
         workers=args.workers,
         fast=args.fast,
+        large_file_threshold=int(args.large_threshold_mb * 1024 * 1024),
+        stream_batch_size=args.stream_batch_size,
     )
     logger.info("Done.")
 

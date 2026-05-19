@@ -35,8 +35,12 @@ def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
     print(f"{'─' * 80}")
 
     for instr_name, count, seq_min, seq_max in gapped:
-        gap_total = (seq_max - seq_min + 1) - count
-        width = (seq_max - seq_min + 1) / N_BUCKETS
+        expected_total = seq_max - seq_min + 1
+        gap_total = expected_total - count
+
+        # Distribute rows evenly across buckets: remainder goes to first R buckets
+        b_expected_base = expected_total // N_BUCKETS
+        remainder = expected_total % N_BUCKETS
 
         # One streaming pass per gapped instrument — safe because:
         # 1. streaming=True means only a few row groups in memory
@@ -44,13 +48,19 @@ def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
         bucket_counts = (
             lf.filter(pl.col("instrument_name") == instr_name)
             .with_columns(
+                # Map trade_seq to bucket via integer arithmetic:
+                # bucket = (trade_seq - seq_min) * N_BUCKETS // expected_total
+                # This avoids floating-point rounding issues entirely.
                 (
-                    (pl.col("trade_seq") - seq_min) / width
+                    (pl.col("trade_seq") - seq_min)
+                    .cast(pl.Int64)
+                    .mul(N_BUCKETS)
+                    .truediv(expected_total)
+                    .floor()
+                    .cast(pl.UInt32)
+                    .clip(0, N_BUCKETS - 1)
+                    .alias("bucket")
                 )
-                .floor()
-                .cast(pl.UInt32)
-                .clip(0, N_BUCKETS - 1)
-                .alias("bucket")
             )
             .group_by("bucket")
             .len()
@@ -61,13 +71,13 @@ def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
         counts_map = dict(bucket_counts.iter_rows())
 
         print(f"\n{instr_name} — {gap_total:,} gaps "
-              f"(expected {seq_max - seq_min + 1:,}, got {count:,})")
+              f"(expected {expected_total:,}, got {count:,})")
         print(f"  {'Bucket':>8s}  {'Rows':>10s}  {'Expected':>10s}  {'Deficit':>10s}")
         print(f"  {'─'*8}  {'─'*10}  {'─'*10}  {'─'*10}")
 
         for b in range(N_BUCKETS):
             b_rows = counts_map.get(b, 0)
-            b_expected = int(width)
+            b_expected = b_expected_base + (1 if b < remainder else 0)
             deficit = b_expected - b_rows
 
             if deficit > 0:

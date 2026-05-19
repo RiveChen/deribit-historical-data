@@ -12,6 +12,7 @@ Performance characteristics:
 import argparse
 import io
 import logging
+import mmap
 import os
 import concurrent.futures
 from collections.abc import Generator
@@ -92,7 +93,10 @@ def _read_and_dedup_file(
 # ---------------------------------------------------------------------------
 # Worker: large files  (streaming, main thread)
 #
-# Uses binary-mode file reading so fh.tell() works for byte-level progress.
+# Uses mmap for zero-copy batch splitting — finds batch boundaries via
+# ``find(b'\n')`` and hands each chunk directly to ``pl.read_ndjson``
+# without per-line Python decode/append overhead.
+#
 # trade_seq within a single file is monotonic, so cross-batch dedup simply
 # filters "trade_seq <= max_seen" — no need for a set or is_in.
 # ---------------------------------------------------------------------------
@@ -103,52 +107,71 @@ def _stream_batches(
     batch_size: int = _BATCH_SIZE,
 ) -> Generator[tuple[str, pl.DataFrame, int, str, int], None, None]:
     """
-    Stream-read a **large** JSONL file in fixed-size batches.
+    Stream-read a **large** JSONL file in fixed-size batches via mmap.
 
     Yields (filename, df, intra_dup_count, instrument_name, pos).
     *intra-batch dedup* is done here via ``unique()``.
     *cross-batch dedup* is the caller's responsibility via ``max_trade_seq``.
     """
-    lines: list[str] = []
-    batch_id = 0
+    fd = os.open(f, os.O_RDONLY)
+    try:
+        with mmap.mmap(fd, 0, access=mmap.ACCESS_READ) as mm:
+            file_size = len(mm)
+            batch_id = 0
+            pos = 0  # current byte offset in mmap
+            lines_bytes: list[bytes] = []
 
-    def _parse() -> tuple[pl.DataFrame, int, str] | None:
-        nonlocal lines, batch_id
-        if not lines:
-            return None
-        text = "\n".join(lines)
-        lines.clear()
-        df = pl.read_ndjson(io.StringIO(text), schema=COMPREHENSIVE_SCHEMA)
-        if df.is_empty():
-            return None
-        before = len(df)
-        df = df.unique(subset=["instrument_name", "trade_seq"], keep="first")
-        intra_dup = before - len(df)
-        if intra_dup:
-            logger.debug(
-                f"{f.name}[batch {batch_id}]: removed {intra_dup} intra-batch dups"
-            )
-        instr_name = str(df["instrument_name"][0])
-        batch_id += 1
-        return (df, intra_dup, instr_name)
+            def _parse_bytes() -> tuple[pl.DataFrame, int, str] | None:
+                nonlocal lines_bytes, batch_id
+                if not lines_bytes:
+                    return None
+                # Use BytesIO — Polars reads directly without copying
+                chunk = b"\n".join(lines_bytes)
+                lines_bytes.clear()
+                df = pl.read_ndjson(io.BytesIO(chunk), schema=COMPREHENSIVE_SCHEMA)
+                if df.is_empty():
+                    return None
+                before = len(df)
+                df = df.unique(subset=["instrument_name", "trade_seq"], keep="first")
+                intra_dup = before - len(df)
+                if intra_dup:
+                    logger.debug(
+                        f"{f.name}[batch {batch_id}]: removed {intra_dup} intra-batch dups"
+                    )
+                instr_name = str(df["instrument_name"][0])
+                batch_id += 1
+                return (df, intra_dup, instr_name)
 
-    with f.open("rb") as fh:
-        for raw_line in fh:
-            line = raw_line.decode("utf-8").strip()
-            if not line:
-                continue
-            lines.append(line)
-            if len(lines) >= batch_size:
-                result = _parse()
-                if result:
-                    df, intra, instr = result
-                    yield (f.name, df, intra, instr, fh.tell())
+            while pos < file_size:
+                # Find the end of the current line
+                nl = mm.find(b"\n", pos)
+                if nl == -1:
+                    # Last line (no trailing newline)
+                    line = mm[pos:]
+                    if line:
+                        lines_bytes.append(line)
+                    break
+                line = mm[pos:nl]
+                pos = nl + 1  # skip past '\n'
 
-        # tail
-        result = _parse()
-        if result:
-            df, intra, instr = result
-            yield (f.name, df, intra, instr, fh.tell())
+                if not line:
+                    continue  # skip empty lines
+
+                lines_bytes.append(line)
+
+                if len(lines_bytes) >= batch_size:
+                    result = _parse_bytes()
+                    if result:
+                        df, intra, instr = result
+                        yield (f.name, df, intra, instr, pos)
+
+            # tail
+            result = _parse_bytes()
+            if result:
+                df, intra, instr = result
+                yield (f.name, df, intra, instr, pos)
+    finally:
+        os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -201,11 +224,6 @@ def generate_parquet(
         total_duplicates = 0
 
         # Dedup structures
-        # Phase 1 (streaming): max_seqs tracks per-instrument max trade_seq.
-        #   Deribit trade_seq is monotonic within a single file/instrument,
-        #   so "trade_seq > max_seqs[instr]" is a correct duplicate filter.
-        # Phase 2 (small files): prev_keys tracks all seen (instr, seq) pairs.
-        #   Small files may have overlapping time ranges, so we need the full set.
         max_seqs: dict[str, int] = {}
         prev_keys: dict[str, set[int]] = {}
 
@@ -261,9 +279,6 @@ def generate_parquet(
                                 max_seen = max_seqs.get(instr, -1)
                                 if max_seen >= 0:
                                     before = len(df)
-                                    # trade_seq is monotonic within one file,
-                                    # so filtering by > max_seen is sufficient
-                                    # and O(N) with zero Python set overhead.
                                     df = df.filter(
                                         pl.col("trade_seq").cast(pl.Int64)
                                         > max_seen
@@ -276,7 +291,6 @@ def generate_parquet(
                                         )
                                     total_duplicates += cross_dup
 
-                                # Update max_seqs with current batch's max
                                 batch_max = df.select(
                                     pl.col("trade_seq").cast(pl.Int64).max()
                                 ).item()

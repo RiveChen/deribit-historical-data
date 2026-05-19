@@ -2,9 +2,8 @@
 Post-download data integrity validation.
 
 Validates generated Parquet files by checking trade_seq continuity for each
-instrument individually. Uses streaming-safe aggregations: group_by on
-~357 instruments produces a tiny hash table, while count/min/max are O(1)
-memory accumulators — safe even on 90 GB files.
+instrument individually. Uses streaming-only execution: group_by on ~357
+instruments with count/min/max accumulators, all in a single streaming pass.
 """
 
 import argparse
@@ -39,9 +38,9 @@ def validate_parquet(parquet_path: Path) -> None:
     for col, dtype in schema.items():
         print(f"  {col:25s}  {str(dtype):12s}")
 
-    # Per-instrument streaming aggregation.
-    # group_by on ~357 keys is safe (tiny hash table).
-    # count/min/max are O(1) streaming accumulators.
+    # Single streaming pass: group_by on ~357 keys is safe (tiny hash table),
+    # streaming=True forces Polars to use the streaming engine so only a few
+    # row groups are held in memory at a time.
     instr_stats = (
         lf.group_by("instrument_name")
         .agg(
@@ -49,9 +48,11 @@ def validate_parquet(parquet_path: Path) -> None:
                 pl.len().alias("count"),
                 pl.min("trade_seq").alias("seq_min"),
                 pl.max("trade_seq").alias("seq_max"),
+                pl.min("timestamp").alias("ts_min"),
+                pl.max("timestamp").alias("ts_max"),
             ]
         )
-        .collect()
+        .collect(streaming=True)
     )
 
     print(f"\n{'Instrument':35s} {'Rows':>10s} {'Seq Range':>24s} {'Status':20s}")
@@ -60,16 +61,22 @@ def validate_parquet(parquet_path: Path) -> None:
     total_rows = 0
     ok_count = 0
     gap_count = 0
-    ts_min_global = None
-    ts_max_global = None
+    ts_min_global = instr_stats[0, "ts_min"]
+    ts_max_global = instr_stats[0, "ts_max"]
 
     # Sort by instrument name for deterministic output
     instr_stats = instr_stats.sort("instrument_name")
 
     for row in instr_stats.iter_rows():
-        instr, count, seq_min, seq_max = row
+        instr, count, seq_min, seq_max, ts_min, ts_max = row
         total_rows += count
         expected = seq_max - seq_min + 1
+
+        # Track global time range across instruments
+        if ts_min < ts_min_global:
+            ts_min_global = ts_min
+        if ts_max > ts_max_global:
+            ts_max_global = ts_max
 
         if count < expected:
             gap = expected - count
@@ -83,25 +90,15 @@ def validate_parquet(parquet_path: Path) -> None:
             f"{instr:35s} {count:>10,} {seq_min:>12,}..{seq_max:<12,} {status:20s}"
         )
 
-    # Global time range
-    ts_stats = (
-        lf.select(
-            [
-                pl.min("timestamp").alias("ts_min"),
-                pl.max("timestamp").alias("ts_max"),
-            ]
-        )
-        .collect()
-    )
-    t_min = datetime.fromtimestamp(
-        int(ts_stats[0, "ts_min"]) / 1000, tz=timezone.utc
-    ).strftime("%Y-%m-%d")
-    t_max = datetime.fromtimestamp(
-        int(ts_stats[0, "ts_max"]) / 1000, tz=timezone.utc
-    ).strftime("%Y-%m-%d")
-
     # File size
     size_mb = parquet_path.stat().st_size / (1024 * 1024)
+
+    t_min = datetime.fromtimestamp(
+        int(ts_min_global) / 1000, tz=timezone.utc
+    ).strftime("%Y-%m-%d")
+    t_max = datetime.fromtimestamp(
+        int(ts_max_global) / 1000, tz=timezone.utc
+    ).strftime("%Y-%m-%d")
 
     print(f"\n{'=' * 80}")
     print(f"Total rows: {total_rows:,}")

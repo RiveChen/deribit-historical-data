@@ -10,7 +10,7 @@
 - **优雅关闭** — 处理 `SIGINT`/`SIGTERM` 信号，保留已收集的全部数据
 - **JSONL 输出** — 原始数据保存为换行符分隔的 JSON，每行一笔成交
 - **Parquet 导出** — 工具脚本可将所有 JSONL 文件合并为单个压缩 Parquet 文件（支持去重）
-- **数据校验** — 下载后完整性检查（序列号间隙检测、重复检测、Schema 分析）
+- **数据校验** — 流式 Parquet 校验（间隙检测、重复估算、Schema 分析），无需将完整文件加载到内存
 - **支持多种币种和品种** — 支持 BTC 和 ETH，期货和期权
 
 ## 环境要求
@@ -102,14 +102,11 @@ uv run python scripts/gen_parquet.py --type future --no-dedup
 
 ### 4. 数据校验
 
-下载后检查数据完整性 — 检测间隙、重复，并报告每个交易对的统计信息。
+流式 Parquet 校验 — 使用流式安全聚合检测间隙和重复，无需将完整文件加载到内存（避免 90 GB future.parquet 的 OOM 问题）。
 
 ```bash
-# 校验期货和期权数据（JSONL + Parquet）
+# 校验期货和期权的 Parquet 文件
 uv run python scripts/validate_data.py
-
-# 仅校验 JSONL 文件
-uv run python scripts/validate_data.py --mode jsonl
 
 # 仅校验特定类型
 uv run python scripts/validate_data.py --type future

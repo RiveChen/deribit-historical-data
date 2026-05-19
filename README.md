@@ -10,7 +10,7 @@
 - **Graceful shutdown** — handles `SIGINT`/`SIGTERM` cleanly, preserving all data collected so far
 - **JSONL output** — raw data saved as newline-delimited JSON, one trade per line
 - **Parquet export** — utility script to merge all JSONL files into a single compressed Parquet file (with dedup)
-- **Data validation** — post-download integrity checks (gap detection, duplicates, schema analysis)
+- **Data validation** — streaming Parquet validation (gap detection, dedup estimate, schema analysis) without loading the full file into memory
 - **Both currency & instrument kinds** — supports BTC and ETH, Futures and Options
 
 ## Requirements
@@ -106,14 +106,11 @@ Performance tips:
 
 ### 4. Validate Data
 
-Check data integrity after download — detects gaps, duplicates, and reports per-instrument statistics.
+Streaming Parquet validation — detects gaps and duplicates using streaming-safe aggregations, without loading the full file into memory (avoids OOM on 90 GB future.parquet).
 
 ```bash
-# Validate both future and option data (JSONL + Parquet)
+# Validate both future and option Parquet files
 uv run python scripts/validate_data.py
-
-# Validate only JSONL files
-uv run python scripts/validate_data.py --mode jsonl
 
 # Validate only a specific type
 uv run python scripts/validate_data.py --type future

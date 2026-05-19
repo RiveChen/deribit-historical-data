@@ -20,7 +20,30 @@ import polars as pl
 
 from deribit_fetcher.config import settings
 from deribit_fetcher.log import setup_logging
-from scripts.gen_parquet import COMPREHENSIVE_SCHEMA
+
+# Shared schema — must match gen_parquet.py's COMPREHENSIVE_SCHEMA
+_TRADE_SCHEMA = pl.Schema(
+    {
+        "trade_seq": pl.Int64,
+        "trade_id": pl.String,
+        "timestamp": pl.Int64,
+        "tick_direction": pl.Int64,
+        "price": pl.Float64,
+        "mark_price": pl.Float64,
+        "iv": pl.Float64,
+        "instrument_name": pl.String,
+        "index_price": pl.Float64,
+        "direction": pl.String,
+        "amount": pl.Float64,
+        "contracts": pl.Float64,
+        "block_trade_id": pl.String,
+        "block_rfq_id": pl.String,
+        "block_trade_leg_count": pl.Int64,
+        "combo_id": pl.String,
+        "combo_trade_id": pl.String,
+        "liquidation": pl.String,
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +74,7 @@ def validate_jsonl(data_dir: Path) -> None:
 
     for f in jsonl_files:
         instr = f.stem
-        df = pl.read_ndjson(f, schema=COMPREHENSIVE_SCHEMA)
+        df = pl.read_ndjson(f, schema=_TRADE_SCHEMA)
         if df.is_empty():
             reports.append((instr, 0, "N/A", "N/A", "-"))
             continue

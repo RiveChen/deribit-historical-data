@@ -91,28 +91,28 @@ def _read_and_dedup_file(
 
 # ---------------------------------------------------------------------------
 # Worker: large files  (streaming, main thread)
+#
+# Uses binary-mode file reading so fh.tell() works for byte-level progress.
+# trade_seq within a single file is monotonic, so cross-batch dedup simply
+# filters "trade_seq <= max_seen" — no need for a set or is_in.
 # ---------------------------------------------------------------------------
 
 
 def _stream_batches(
     f: Path,
     batch_size: int = _BATCH_SIZE,
-) -> Generator[
-    tuple[str, pl.DataFrame, int, str, set[int], int], None, None
-]:
+) -> Generator[tuple[str, pl.DataFrame, int, str, int], None, None]:
     """
     Stream-read a **large** JSONL file in fixed-size batches.
 
-    Uses binary mode + manual decode to support ``fh.tell()`` for byte-level
-    progress tracking (text-mode file objects disable ``tell()`` when used
-    with ``next()`` / generator iteration).
-
-    Yields (filename, df, intra_dup_count, instrument_name, seq_set, pos).
+    Yields (filename, df, intra_dup_count, instrument_name, pos).
+    *intra-batch dedup* is done here via ``unique()``.
+    *cross-batch dedup* is the caller's responsibility via ``max_trade_seq``.
     """
     lines: list[str] = []
     batch_id = 0
 
-    def _parse() -> tuple[pl.DataFrame, int, str, set[int]] | None:
+    def _parse() -> tuple[pl.DataFrame, int, str] | None:
         nonlocal lines, batch_id
         if not lines:
             return None
@@ -129,11 +129,9 @@ def _stream_batches(
                 f"{f.name}[batch {batch_id}]: removed {intra_dup} intra-batch dups"
             )
         instr_name = str(df["instrument_name"][0])
-        seqs = set(int(v) for v in df["trade_seq"].to_list())
         batch_id += 1
-        return (df, intra_dup, instr_name, seqs)
+        return (df, intra_dup, instr_name)
 
-    # Use binary mode so fh.tell() works (text-mode iteration disables tell())
     with f.open("rb") as fh:
         for raw_line in fh:
             line = raw_line.decode("utf-8").strip()
@@ -143,14 +141,14 @@ def _stream_batches(
             if len(lines) >= batch_size:
                 result = _parse()
                 if result:
-                    df, intra, instr, seqs = result
-                    yield (f.name, df, intra, instr, seqs, fh.tell())
+                    df, intra, instr = result
+                    yield (f.name, df, intra, instr, fh.tell())
 
         # tail
         result = _parse()
         if result:
-            df, intra, instr, seqs = result
-            yield (f.name, df, intra, instr, seqs, fh.tell())
+            df, intra, instr = result
+            yield (f.name, df, intra, instr, fh.tell())
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +199,16 @@ def generate_parquet(
         writer: pq.ParquetWriter | None = None
         total_rows = 0
         total_duplicates = 0
+
+        # Dedup structures
+        # Phase 1 (streaming): max_seqs tracks per-instrument max trade_seq.
+        #   Deribit trade_seq is monotonic within a single file/instrument,
+        #   so "trade_seq > max_seqs[instr]" is a correct duplicate filter.
+        # Phase 2 (small files): prev_keys tracks all seen (instr, seq) pairs.
+        #   Small files may have overlapping time ranges, so we need the full set.
+        max_seqs: dict[str, int] = {}
         prev_keys: dict[str, set[int]] = {}
+
         pending: list[pa.Table] = []
         processed_count = 0
 
@@ -220,53 +227,9 @@ def generate_parquet(
                     output_file, table.schema, compression=compression
                 )
 
-        def _consume(
-            fname: str,
-            df: pl.DataFrame,
-            intra_dup: int,
-            instr_name: str | None,
-            seq_set: set[int] | None,
-        ) -> None:
-            nonlocal total_rows, total_duplicates
-            total_duplicates += intra_dup
-
-            if df is None or df.is_empty():
-                return
-
-            if dedup and instr_name is not None and seq_set is not None:
-                seen_seqs = prev_keys.get(instr_name)
-                if seen_seqs:
-                    before = len(df)
-                    df = df.filter(
-                        ~pl.col("trade_seq").cast(pl.Int64).is_in(seen_seqs)
-                    )
-                    cross_dup = before - len(df)
-                    if cross_dup:
-                        logger.debug(
-                            f"{fname}: removed {cross_dup} cross-file dups"
-                        )
-                    total_duplicates += cross_dup
-
-                if instr_name in prev_keys:
-                    prev_keys[instr_name].update(seq_set)
-                else:
-                    prev_keys[instr_name] = seq_set
-
-            total_rows += len(df)
-            if df.is_empty():
-                return
-
-            table = df.to_arrow()
-            _init_writer(table)
-            pending.append(table)
-
-            if (
-                sum(len(t) for t in pending) >= _BATCH_SIZE
-                or len(pending) >= _MAX_PENDING_TABLES
-            ):
-                _flush_pending()
-
-        # Phase 1 - large files (streaming)
+        # ═══════════════════════════════════════════════════════════════
+        # Phase 1 - large files (streaming, main thread)
+        # ═══════════════════════════════════════════════════════════════
         if large_files:
             logger.info("Phase 1/2: streaming large files...")
             with tqdm(
@@ -284,18 +247,117 @@ def generate_parquet(
                         leave=False,
                     ) as inner_pbar:
                         last_pos = 0
-                        for fname, df, intra, instr, seqs, pos in _stream_batches(
+                        for fname, df, intra, instr, pos in _stream_batches(
                             f, stream_batch_size
                         ):
-                            _consume(fname, df, intra, instr, seqs)
+                            total_duplicates += intra
+
+                            if df.is_empty():
+                                inner_pbar.update(pos - last_pos)
+                                last_pos = pos
+                                continue
+
+                            if dedup and instr is not None:
+                                max_seen = max_seqs.get(instr, -1)
+                                if max_seen >= 0:
+                                    before = len(df)
+                                    # trade_seq is monotonic within one file,
+                                    # so filtering by > max_seen is sufficient
+                                    # and O(N) with zero Python set overhead.
+                                    df = df.filter(
+                                        pl.col("trade_seq").cast(pl.Int64)
+                                        > max_seen
+                                    )
+                                    cross_dup = before - len(df)
+                                    if cross_dup:
+                                        logger.debug(
+                                            f"{fname}: removed {cross_dup} "
+                                            f"cross-batch dups (max={max_seen})"
+                                        )
+                                    total_duplicates += cross_dup
+
+                                # Update max_seqs with current batch's max
+                                batch_max = df.select(
+                                    pl.col("trade_seq").cast(pl.Int64).max()
+                                ).item()
+                                if batch_max is not None and batch_max > max_seen:
+                                    max_seqs[instr] = batch_max
+
+                            total_rows += len(df)
+                            if df.is_empty():
+                                inner_pbar.update(pos - last_pos)
+                                last_pos = pos
+                                continue
+
+                            table = df.to_arrow()
+                            _init_writer(table)
+                            pending.append(table)
+
+                            if (
+                                sum(len(t) for t in pending) >= _BATCH_SIZE
+                                or len(pending) >= _MAX_PENDING_TABLES
+                            ):
+                                _flush_pending()
+
                             inner_pbar.update(pos - last_pos)
                             last_pos = pos
                     processed_count += 1
                     pbar.update(1)
 
+        # ═══════════════════════════════════════════════════════════════
         # Phase 2 - small files (thread pool)
+        # ═══════════════════════════════════════════════════════════════
         if small_files:
             logger.info("Phase 2/2: processing small files in parallel...")
+
+            def _consume_small(
+                fname: str,
+                df: pl.DataFrame | None,
+                intra_dup: int,
+                instr_name: str | None,
+                seq_set: set[int] | None,
+            ) -> None:
+                nonlocal total_rows, total_duplicates
+                total_duplicates += intra_dup
+
+                if df is None or df.is_empty():
+                    return
+
+                if dedup and instr_name is not None and seq_set is not None:
+                    seen_seqs = prev_keys.get(instr_name)
+                    if seen_seqs:
+                        before = len(df)
+                        df = df.filter(
+                            ~pl.col("trade_seq")
+                            .cast(pl.Int64)
+                            .is_in(seen_seqs)
+                        )
+                        cross_dup = before - len(df)
+                        if cross_dup:
+                            logger.debug(
+                                f"{fname}: removed {cross_dup} cross-file dups"
+                            )
+                        total_duplicates += cross_dup
+
+                    if instr_name in prev_keys:
+                        prev_keys[instr_name].update(seq_set)
+                    else:
+                        prev_keys[instr_name] = seq_set
+
+                total_rows += len(df)
+                if df.is_empty():
+                    return
+
+                table = df.to_arrow()
+                _init_writer(table)
+                pending.append(table)
+
+                if (
+                    sum(len(t) for t in pending) >= _BATCH_SIZE
+                    or len(pending) >= _MAX_PENDING_TABLES
+                ):
+                    _flush_pending()
+
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=effective_workers
             ) as executor:
@@ -311,7 +373,7 @@ def generate_parquet(
                 ) as pbar:
                     for future in concurrent.futures.as_completed(futures):
                         result = future.result()
-                        _consume(*result)
+                        _consume_small(*result)
                         processed_count += 1
                         pbar.update(1)
 

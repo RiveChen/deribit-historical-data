@@ -2,8 +2,11 @@
 Post-download data integrity validation.
 
 Validates generated Parquet files by checking trade_seq continuity for each
-instrument individually. Uses streaming-only execution: group_by on ~357
-instruments with count/min/max accumulators, all in a single streaming pass.
+instrument individually. For instruments with gaps, a histogram overlay shows
+the gap distribution across equal-sized buckets of the seq range.
+
+Memory safety: all group_by operations use engine="streaming" so only a few
+row groups are held in memory at a time.
 """
 
 import argparse
@@ -17,6 +20,64 @@ from deribit_fetcher.config import settings
 from deribit_fetcher.log import setup_logging
 
 logger = logging.getLogger(__name__)
+
+N_BUCKETS = 10
+
+
+def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
+    """For each instrument with gaps, show a per-bucket histogram.
+
+    Each instrument's seq range is divided into N_BUCKETS equal intervals.
+    A separate streaming pass is made per instrument (typically 1-2, at most ~357).
+    """
+    print(f"\n{'─' * 80}")
+    print(f"Gap Distribution ({N_BUCKETS} equal-sized buckets per instrument)")
+    print(f"{'─' * 80}")
+
+    for instr_name, count, seq_min, seq_max in gapped:
+        gap_total = (seq_max - seq_min + 1) - count
+        width = (seq_max - seq_min + 1) / N_BUCKETS
+
+        # One streaming pass per gapped instrument — safe because:
+        # 1. streaming=True means only a few row groups in memory
+        # 2. Typically only 1-2 instruments have gaps
+        bucket_counts = (
+            lf.filter(pl.col("instrument_name") == instr_name)
+            .with_columns(
+                (
+                    (pl.col("trade_seq") - seq_min) / width
+                )
+                .floor()
+                .cast(pl.UInt32)
+                .clip(0, N_BUCKETS - 1)
+                .alias("bucket")
+            )
+            .group_by("bucket")
+            .len()
+            .collect(engine="streaming")
+        )
+
+        # Build a lookup: bucket -> actual row count
+        counts_map = dict(bucket_counts.iter_rows())
+
+        print(f"\n{instr_name} — {gap_total:,} gaps "
+              f"(expected {seq_max - seq_min + 1:,}, got {count:,})")
+        print(f"  {'Bucket':>8s}  {'Rows':>10s}  {'Expected':>10s}  {'Deficit':>10s}")
+        print(f"  {'─'*8}  {'─'*10}  {'─'*10}  {'─'*10}")
+
+        for b in range(N_BUCKETS):
+            b_rows = counts_map.get(b, 0)
+            b_expected = int(width)
+            deficit = b_expected - b_rows
+
+            if deficit > 0:
+                marker = " ⚠️"
+            else:
+                marker = "   "
+            print(
+                f"  {b + 1:>8d}  {b_rows:>10,}  {b_expected:>10,}  "
+                f"{deficit:>+10,}{marker}"
+            )
 
 
 def validate_parquet(parquet_path: Path) -> None:
@@ -38,9 +99,7 @@ def validate_parquet(parquet_path: Path) -> None:
     for col, dtype in schema.items():
         print(f"  {col:25s}  {str(dtype):12s}")
 
-    # Single streaming pass: group_by on ~357 keys is safe (tiny hash table),
-    # streaming=True forces Polars to use the streaming engine so only a few
-    # row groups are held in memory at a time.
+    # Pass 1: per-instrument stats (streaming-safe)
     instr_stats = (
         lf.group_by("instrument_name")
         .agg(
@@ -61,10 +120,11 @@ def validate_parquet(parquet_path: Path) -> None:
     total_rows = 0
     ok_count = 0
     gap_count = 0
+    gapped_instruments = []
+
     ts_min_global = instr_stats[0, "ts_min"]
     ts_max_global = instr_stats[0, "ts_max"]
 
-    # Sort by instrument name for deterministic output
     instr_stats = instr_stats.sort("instrument_name")
 
     for row in instr_stats.iter_rows():
@@ -72,7 +132,6 @@ def validate_parquet(parquet_path: Path) -> None:
         total_rows += count
         expected = seq_max - seq_min + 1
 
-        # Track global time range across instruments
         if ts_min < ts_min_global:
             ts_min_global = ts_min
         if ts_max > ts_max_global:
@@ -82,6 +141,7 @@ def validate_parquet(parquet_path: Path) -> None:
             gap = expected - count
             status = f"⚠️  {gap} gaps"
             gap_count += 1
+            gapped_instruments.append((instr, count, seq_min, seq_max))
         else:
             status = "✅"
             ok_count += 1
@@ -89,6 +149,10 @@ def validate_parquet(parquet_path: Path) -> None:
         print(
             f"{instr:35s} {count:>10,} {seq_min:>12,}..{seq_max:<12,} {status:20s}"
         )
+
+    # Pass 2: gap histogram for instruments with gaps
+    if gapped_instruments:
+        _show_gap_histogram(lf, gapped_instruments)
 
     # File size
     size_mb = parquet_path.stat().st_size / (1024 * 1024)

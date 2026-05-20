@@ -2,6 +2,31 @@
 
 > An async scraper for downloading full historical trade data from the [Deribit History API v2](https://docs.deribit.com/#public-get_last_trades_by_instrument) for both **Futures** and **Options**.
 
+*If it helps, stars are appreciated!* ⭐
+
+## tl;dr
+
+``` shell
+git clone https://github.com/RiveChen/deribit-historical-data.git
+cd deribit-historical-data
+
+# install `uv` if you haven't already, then
+uv sync
+
+# for all BTC option trades data:
+uv run python -m deribit_fetcher.option
+# note: it may take 1-2 hours and ~10GB disk space for BTC options
+
+# for all BTC future trades data:
+uv run python -m deribit_fetcher.future
+# note: it may take 3-4 hours and ~90GB disk space for BTC futures 
+
+
+# if you want to merge the downloaded JSONL to a single parquet file:
+uv run python scripts/gen_parquet.py --type option
+uv run python scripts/gen_parquet.py --type future
+```
+
 ## Features
 
 - **Full history download** — fetches every single trade, not just recent ones, using `trade_seq`-based chunking
@@ -39,7 +64,7 @@ pip install -e .
 All settings are managed via environment variables:
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+| ---------- | --------- | ------------- |
 | `CURRENCY` | `BTC` | Currency to fetch (`BTC` or `ETH`) |
 | `CHUNK_SIZE` | `10000` | Trades per API request (Deribit max is 10000) |
 | `MAX_RPS` | `20` | Requests per second limit |
@@ -96,10 +121,12 @@ uv run python scripts/gen_parquet.py --type future --no-dedup
 ```
 
 The generator uses a two-phase strategy:
+
 - **Small files** (<100 MB, typical options): processed in parallel using a thread pool
 - **Large files** (>=100 MB, typical perpetuals): split into `\n`-aligned byte blocks and processed in parallel using a process pool (`--stream-workers`), achieving near-SSD read speeds by saturating disk queue depth. The single-threaded fallback (`--stream-workers 1`) uses mmap for zero-copy batch splitting.
 
 Performance tips:
+
 - For a single large perpetual file: `--stream-workers <N>` defaults to all CPU cores
 - Block size can be tuned: `--block-bytes 268435456` (256 MB default, smaller = finer granularity)
 - Trade space for speed: `--fast` (lz4 instead of zstd, ~10-15% larger file)
@@ -118,7 +145,7 @@ uv run python scripts/validate_data.py --type future
 
 ### Output Structure
 
-```
+``` txt
 data/
 └── {CURRENCY}/
     ├── future/
@@ -135,7 +162,7 @@ data/
 
 ## Project Structure
 
-```
+``` txt
 src/deribit_fetcher/
 ├── __init__.py          # Package version
 ├── client.py            # Deribit API client (rate limiting, retries)
@@ -178,7 +205,7 @@ scripts/
 - On restart, already-completed chunks/instruments are skipped
 - `MAX(last_no, ?)` guard in option progress prevents regression on crash recovery
 
-For detailed API behavior (e.g. `has_more` semantics, chunk boundary overlap), see [api-reference.md](api-reference.md).
+For detailed API behavior, see: [api-reference.md](./api-reference.md)
 
 ## Data Notes
 

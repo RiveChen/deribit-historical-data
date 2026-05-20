@@ -174,7 +174,7 @@ scripts/
 - 重启时自动跳过已完成的块/交易对
 - 期权进度使用 `MAX(last_no, ?)` 保护，防止崩溃恢复时进度回退
 
-有关 API 行为的详细信息（如 `has_more` 语义、块边界重叠等），请参阅 [api-reference.md](api-reference.md)。
+有关 API 行为的详细信息（如 `has_more` 语义、块边界重叠等），请参阅 [api-reference.md](api-reference.zh.md)。
 
 ## 数据说明
 

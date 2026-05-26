@@ -28,6 +28,20 @@ class Config:
     PROXY: str | None = None
 
     def __post_init__(self):
+        # Override CURRENCY from environment if set
+        env_currency = os.environ.get("CURRENCY")
+        if env_currency:
+            self.CURRENCY = env_currency.strip()
+
+        # Recompute paths based on actual CURRENCY value
+        # (BASE_DIR and derivatives are computed at class definition time,
+        #  so they must be recalculated here to reflect env var overrides)
+        self.BASE_DIR = Path("./data") / self.CURRENCY
+        self.DATA_FUTURE_DIR = self.BASE_DIR / "future"
+        self.DATA_OPTION_DIR = self.BASE_DIR / "option"
+        self.FUTURE_DB_PATH = self.BASE_DIR / "future.db"
+        self.OPTION_DB_PATH = self.BASE_DIR / "option.db"
+
         # Resolve proxy from environment (try uppercase and lowercase variants)
         self.PROXY = (
             os.environ.get("HTTP_PROXY")

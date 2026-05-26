@@ -26,6 +26,16 @@ class FetcherEngine:
         self.write_batch_size = write_batch_size
         self.task_queue = Queue(maxsize=task_queue_size)
         self.storage_queue = Queue(maxsize=storage_queue_size)
+        # Tracks number of completed instruments (used by option streaming)
+        self.completed_count: int = 0
+
+    async def enqueue_task(self, task: dict) -> None:
+        """Public method to enqueue a new task during streaming.
+
+        Used by ``on_success`` callbacks (e.g. option's streaming fetch)
+        to dynamically add follow-up chunks to the task queue.
+        """
+        await self.task_queue.put(task)
 
     async def _producer_worker(
         self,
@@ -93,6 +103,9 @@ class FetcherEngine:
                         total_buffered = 0
                     self.storage_queue.task_done()
                     break
+
+                if item.get("finished"):
+                    self.completed_count += 1
 
                 if custom_pbar_updater:
                     custom_pbar_updater(item, pbar)

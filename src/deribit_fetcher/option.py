@@ -1,7 +1,7 @@
 import asyncio
-import signal
 from tqdm.asyncio import tqdm
 
+from deribit_fetcher import run_main
 from deribit_fetcher.progress import DatabaseClient, OptionProgressRepo
 from deribit_fetcher.client import DeribitClient
 from deribit_fetcher.config import settings, logger
@@ -121,21 +121,12 @@ async def run(stop_event: asyncio.Event):
                         "is_expired": tasking["is_expired"],
                     }
                     if not stop_event.is_set():
-                        await engine.task_queue.put(next_task)
+                        await engine.enqueue_task(next_task)
 
             def custom_pbar_updater(item: dict, pbar: tqdm):
-                """Update progress bar: increment completed count on finish, expand total on new chunks."""
+                """Update progress bar: show completed count and expand total on new chunks."""
                 if item.get("finished"):
-                    current_done = pbar.postfix
-                    finished_count = 0
-                    if current_done and isinstance(current_done, dict):
-                        finished_count = current_done.get("Done", 0)
-                    elif current_done and isinstance(current_done, str):
-                        try:
-                            finished_count = int(current_done.split(":")[1].strip())
-                        except Exception:
-                            pass
-                    pbar.set_postfix({"Done": finished_count + 1})
+                    pbar.set_postfix({"Done": engine.completed_count})
 
                 if item.get("should_continue"):
                     with pbar.get_lock():
@@ -198,17 +189,7 @@ async def run(stop_event: asyncio.Event):
 
 async def main():
     """Entry point: sets up signal handlers for graceful shutdown and runs the fetcher."""
-    shutdown_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-
-    def signal_handler():
-        logger.warning("Received signal, stopping...")
-        shutdown_event.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler)
-
-    await run(shutdown_event)
+    await run_main(run)
 
 
 if __name__ == "__main__":

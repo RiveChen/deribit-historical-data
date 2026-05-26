@@ -1,7 +1,7 @@
 import asyncio
-import signal
 from tqdm.asyncio import tqdm
 
+from deribit_fetcher import run_main
 from deribit_fetcher.progress import DatabaseClient, FutureProgressRepo
 from deribit_fetcher.client import DeribitClient
 from deribit_fetcher.config import settings, logger
@@ -148,20 +148,7 @@ async def run(stop_event: asyncio.Event):
 
 async def main():
     """Entry point: sets up signal handlers for graceful shutdown and runs the fetcher."""
-    shutdown_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
-
-    def signal_handler():
-        logger.warning("Received signal, starting graceful shutdown...")
-        shutdown_event.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, signal_handler)
-
-    try:
-        await run(shutdown_event)
-    finally:
-        logger.info("Exited.")
+    await run_main(run)
 
 
 if __name__ == "__main__":

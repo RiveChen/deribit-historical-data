@@ -1,6 +1,7 @@
 """Option data fetcher — fetches historical trade data for options instruments."""
 
 import asyncio
+from typing import Protocol
 
 from tqdm.asyncio import tqdm
 
@@ -10,7 +11,6 @@ from deribit_fetcher.config import logger, settings
 from deribit_fetcher.engine import FetcherEngine
 from deribit_fetcher.fetcher import run_fetcher
 from deribit_fetcher.progress import OptionProgressRepo
-from deribit_fetcher.storage import JSONLinesSink
 
 # Engine constants
 MAX_WORKER_TASKS = 10
@@ -24,7 +24,28 @@ TASK_QUEUE_SIZE = 200
 # ---------------------------------------------------------------------------
 
 
-async def fetch_option_chunk(tasking: dict, *, client: DeribitClient) -> dict:
+class _OptionClientProtocol(Protocol):
+    """Protocol for the client methods used by fetch_option_chunk."""
+
+    async def get_trades_chunk(
+        self, instrument: str, start_seq: int, end_seq: int
+    ) -> tuple[list, bool]: ...  # noqa: E501
+
+
+class _OptionSinkProtocol(Protocol):
+    """Protocol for the sink interface used by sync_option_db."""
+
+    async def flush(self, buffers: dict[str, list[dict]]) -> None: ...
+
+
+class _OptionRepoProtocol(Protocol):
+    """Protocol for the repo interface used by sync_option_db."""
+
+    async def update_option_last_no(self, updates: list[tuple[int, str]]) -> None: ...
+    async def mark_options_complete(self, instruments: list[str]) -> None: ...
+
+
+async def fetch_option_chunk(tasking: dict, *, client: _OptionClientProtocol) -> dict:
     """Fetch a chunk of option trades. Determines whether to continue streaming."""
     instrument = tasking["instrument"]
     start_seq = tasking["start_seq"]
@@ -91,8 +112,8 @@ def option_pbar_updater(item: dict, pbar: tqdm, *, engine: FetcherEngine) -> Non
 async def sync_option_db(
     buffers: dict[str, list[dict]],
     *,
-    sink: JSONLinesSink,
-    repo: OptionProgressRepo,
+    sink: _OptionSinkProtocol,
+    repo: _OptionRepoProtocol,
 ) -> None:
     """Write data to disk and update DB progress.
 

@@ -1,6 +1,7 @@
-"""
-Merge Deribit JSONL files into a single Parquet file with parallel reading,
-intra-file dedup in workers, and streaming cross-file dedup in the main thread.
+"""Merge Deribit JSONL files into a single Parquet file.
+
+Uses parallel reading with intra-file dedup in workers and streaming
+cross-file dedup in the main thread.
 
 Performance characteristics:
 - Small files (<100 MB, typical option data): thread-pool parallel, one file per worker.
@@ -10,11 +11,11 @@ Performance characteristics:
 - Bottleneck (large files): NDJSON line-by-line parsing; mitigated by streaming batches.
 """
 import argparse
+import concurrent.futures
 import io
 import logging
 import mmap
 import os
-import concurrent.futures
 from collections.abc import Generator
 from pathlib import Path
 
@@ -106,8 +107,7 @@ def _stream_batches(
     f: Path,
     batch_size: int = _BATCH_SIZE,
 ) -> Generator[tuple[str, pl.DataFrame, int, str, int], None, None]:
-    """
-    Stream-read a **large** JSONL file in fixed-size batches via mmap.
+    """Stream-read a **large** JSONL file in fixed-size batches via mmap.
 
     Yields (filename, df, intra_dup_count, instrument_name, pos).
     *intra-batch dedup* is done here via ``unique()``.
@@ -188,6 +188,11 @@ def generate_parquet(
     large_file_threshold: int = _LARGE_FILE_THRESHOLD,
     stream_batch_size: int = _BATCH_SIZE,
 ) -> None:
+    """Merge JSONL files in data_dir into a single Parquet file.
+
+    Detects small and large files, processes them accordingly, deduplicates
+    intra-file and cross-file, and writes the result to output_file.
+    """
     if not data_dir.exists():
         logger.error(f"Data directory not found: {data_dir}")
         return
@@ -414,6 +419,7 @@ def generate_parquet(
 
 
 def main() -> None:
+    """Entry point: parse args and run gen_parquet."""
     parser = argparse.ArgumentParser(
         description="Merge Deribit JSONL files into a single Parquet file."
     )

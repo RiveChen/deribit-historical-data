@@ -1,15 +1,17 @@
 """Tests for engine.py: graceful shutdown and producer/consumer behavior."""
 
 import asyncio
-import pytest
-from deribit_fetcher.engine import FetcherEngine
 
+import pytest
+
+from deribit_fetcher.engine import FetcherEngine
 
 pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture
 def engine():
+    """Create a FetcherEngine fixture with small batch sizes for testing."""
     return FetcherEngine(
         worker_count=2,
         write_batch_size=5,
@@ -19,6 +21,8 @@ def engine():
 
 
 class TestGracefulShutdown:
+    """Test suite for engine graceful shutdown behavior."""
+
     async def test_stop_event_during_task_distribution(self, engine):
         """If stop_event is set before engine.run starts, it should return early."""
         stop_event = asyncio.Event()
@@ -44,9 +48,9 @@ class TestGracefulShutdown:
         assert True
 
     async def test_shutdown_with_pending_storage(self, engine):
-        """
-        When stop_event is set mid-flight, consumer should flush remaining buffers.
-        We verify by counting how many times sync_db is called.
+        """Flush remaining buffers when stop_event is set mid-flight.
+
+        Verifies by counting how many times sync_db is called.
         """
         stop_event = asyncio.Event()
         sync_call_count = 0
@@ -154,8 +158,6 @@ class TestGracefulShutdown:
         """Consumer should buffer per instrument correctly."""
         stop_event = asyncio.Event()
         received_buffers = []
-
-        seq_counter = 0
 
         async def fetch_func(tasking):
             return {

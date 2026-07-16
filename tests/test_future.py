@@ -9,8 +9,8 @@ marked complete (which would permanently drop its entire trade history).
 import pytest
 import pytest_asyncio
 
-from deribit_fetcher.progress import DatabaseClient, FutureProgressRepo
 from deribit_fetcher.future import _prepare_tasks
+from deribit_fetcher.progress import DatabaseClient, FutureProgressRepo
 
 pytestmark = pytest.mark.asyncio
 
@@ -19,16 +19,19 @@ class FakeClient:
     """Minimal stand-in for DeribitClient exposing only get_last_trade_seq."""
 
     def __init__(self, seq_map: dict[str, int | None]):
+        """Initialize the mock client with a sequence map."""
         self.seq_map = seq_map
         self.calls: list[str] = []
 
     async def get_last_trade_seq(self, instrument: str) -> int | None:
+        """Return the pre-configured last trade seq for the given instrument."""
         self.calls.append(instrument)
         return self.seq_map[instrument]
 
 
 @pytest_asyncio.fixture
 async def repo(tmp_path):
+    """Create a FutureProgressRepo fixture backed by a temp database."""
     async with DatabaseClient(tmp_path / "future.db") as conn:
         yield FutureProgressRepo(conn)
 

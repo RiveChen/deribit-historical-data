@@ -1,14 +1,16 @@
+"""Option data fetcher — fetches historical trade data for options instruments."""
+
 import asyncio
+
 from tqdm.asyncio import tqdm
 
 from deribit_fetcher import run_main
-from deribit_fetcher.progress import DatabaseClient, OptionProgressRepo
 from deribit_fetcher.client import DeribitClient
-from deribit_fetcher.config import settings, logger
-from deribit_fetcher.log import setup_logging
-from deribit_fetcher.storage import JSONLinesSink
+from deribit_fetcher.config import logger, settings
 from deribit_fetcher.engine import FetcherEngine
-
+from deribit_fetcher.log import setup_logging
+from deribit_fetcher.progress import DatabaseClient, OptionProgressRepo
+from deribit_fetcher.storage import JSONLinesSink
 
 MAX_WORKER_TASKS = 10
 WRITE_BATCH_SIZE = 1
@@ -19,8 +21,7 @@ TASK_QUEUE_SIZE = 200
 async def _prepare_initial_tasks(
     repo: OptionProgressRepo, deribit_client: DeribitClient, refresh_list: bool = True
 ) -> list[dict]:
-    """
-    Prepare initial fetch tasks for options.
+    """Prepare initial fetch tasks for options.
 
     Unlike futures (pre-allocated chunks), options use a streaming approach:
     start from last_no + 1 and dynamically enqueue subsequent chunks via
@@ -28,9 +29,7 @@ async def _prepare_initial_tasks(
     """
     if refresh_list:
         logger.info("Fetching option instrument list...")
-        options = await deribit_client.get_instruments(
-            currency=settings.CURRENCY, kind="option"
-        )
+        options = await deribit_client.get_instruments(currency=settings.CURRENCY, kind="option")
         await repo.upsert_option_list(options)
 
     incomplete_options = await repo.get_incomplete_option_list()
@@ -56,7 +55,7 @@ async def _prepare_initial_tasks(
 
 
 async def run(stop_event: asyncio.Event):
-    """Main fetch routine for options. Uses streaming chunks via the on_success callback."""
+    """Fetch all option trades using streaming chunks via the on_success callback."""
     setup_logging()
 
     async with DatabaseClient(settings.OPTION_DB_PATH) as db_conn:
@@ -83,9 +82,7 @@ async def run(stop_event: asyncio.Event):
                 start_seq = tasking["start_seq"]
                 end_seq = start_seq + settings.CHUNK_SIZE - 1
 
-                trades, has_more = await client.get_trades_chunk(
-                    instrument, start_seq, end_seq
-                )
+                trades, has_more = await client.get_trades_chunk(instrument, start_seq, end_seq)
 
                 storage_item = {
                     "instrument": instrument,
@@ -130,12 +127,12 @@ async def run(stop_event: asyncio.Event):
 
                 if item.get("should_continue"):
                     with pbar.get_lock():
-                        pbar.total += 1
-                        pbar.refresh()
+                        if pbar.total is not None:
+                            pbar.total += 1
+                            pbar.refresh()
 
             async def sync_db(buffers: dict[str, list[dict]]):
-                """
-                Write data to disk and update DB progress.
+                """Write data to disk and update DB progress.
 
                 Write order: disk first, then DB. This is intentional:
                 if a crash happens between flush and DB update, the restart

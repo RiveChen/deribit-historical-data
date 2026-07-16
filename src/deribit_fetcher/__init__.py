@@ -12,7 +12,7 @@ __version__ = "0.1.0"
 async def run_main(
     run_func: Callable[[asyncio.Event], Awaitable[None]],
 ) -> None:
-    """Common entry point: sets up signal handlers for graceful shutdown.
+    """Provide a common entry point for setting up signal handlers for graceful shutdown.
 
     Both future.py and option.py share this same main() pattern.
 

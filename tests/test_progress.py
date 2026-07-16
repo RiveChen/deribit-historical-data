@@ -1,19 +1,19 @@
 """Tests for progress.py: database finalize/resume logic."""
 
+
 import pytest
 import pytest_asyncio
-import aiosqlite
-from pathlib import Path
+
 from deribit_fetcher.progress import (
     DatabaseClient,
     FutureProgressRepo,
     OptionProgressRepo,
 )
-from deribit_fetcher.config import Config
 
 
 @pytest_asyncio.fixture
 async def db(tmp_path):
+    """Create a database connection fixture backed by a temp file."""
     db_path = tmp_path / "test.db"
     async with DatabaseClient(db_path) as conn:
         yield conn
@@ -21,11 +21,13 @@ async def db(tmp_path):
 
 @pytest_asyncio.fixture
 async def future_repo(db):
+    """Create a FutureProgressRepo fixture."""
     return FutureProgressRepo(db)
 
 
 @pytest_asyncio.fixture
 async def option_repo(db):
+    """Create an OptionProgressRepo fixture."""
     return OptionProgressRepo(db)
 
 
@@ -39,7 +41,7 @@ class TestFutureProgressRepo:
         """A chunk with count=10000 should be marked is_done=1 by finalize_chunks."""
         # Insert a "complete" chunk with count >= CHUNK_SIZE
         await future_repo.db.execute(
-            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",
+            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",  # noqa: E501
             ("BTC-PERPETUAL", 1, 10000, 1),
         )
         await future_repo.db.commit()
@@ -56,7 +58,7 @@ class TestFutureProgressRepo:
     async def test_finalize_chunks_skips_partial(self, future_repo):
         """A chunk with count < CHUNK_SIZE and has_more=1 should NOT be marked done."""
         await future_repo.db.execute(
-            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",
+            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",  # noqa: E501
             ("BTC-PERPETUAL", 1, 5000, 1),
         )
         await future_repo.db.commit()
@@ -73,7 +75,7 @@ class TestFutureProgressRepo:
     async def test_finalize_chunks_marks_no_more(self, future_repo):
         """A chunk with has_more=0 (last chunk) should be marked done regardless of count."""
         await future_repo.db.execute(
-            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",
+            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",  # noqa: E501
             ("BTC-PERPETUAL", 5, 350, 0),
         )
         await future_repo.db.commit()
@@ -90,11 +92,11 @@ class TestFutureProgressRepo:
     async def test_get_pending_chunks_excludes_done(self, future_repo):
         """get_pending_chunks should only return is_done=0 chunks."""
         await future_repo.db.execute(
-            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, ?)",  # noqa: E501
             ("BTC-1", 1, 10000, 1, 1),  # done
         )
         await future_repo.db.execute(
-            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, ?)",  # noqa: E501
             ("BTC-1", 2, 10000, 1, 0),  # pending
         )
         await future_repo.db.commit()
@@ -122,7 +124,7 @@ class TestFutureProgressRepo:
             ("BTC-EXPIRED-1",),
         )
         await future_repo.db.execute(
-            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 1)",
+            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 1)",  # noqa: E501
             ("BTC-EXPIRED-1", 1, 10000, 0),
         )
         await future_repo.db.commit()
@@ -145,7 +147,7 @@ class TestFutureProgressRepo:
             ("BTC-ACTIVE-1",),
         )
         await future_repo.db.execute(
-            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 1)",
+            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 1)",  # noqa: E501
             ("BTC-ACTIVE-1", 1, 10000, 1),
         )
         await future_repo.db.commit()
@@ -166,7 +168,7 @@ class TestFutureProgressRepo:
             ("BTC-EXPIRED-PENDING",),
         )
         await future_repo.db.execute(
-            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",
+            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",  # noqa: E501
             ("BTC-EXPIRED-PENDING", 1, 5000, 1),
         )
         await future_repo.db.commit()
@@ -189,7 +191,7 @@ class TestOptionProgressRepo:
     async def test_update_option_last_no_monotonic(self, option_repo):
         """update_option_last_no should never decrease last_no (MAX guard)."""
         await option_repo.db.execute(
-            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, 0)",
+            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, 0)",  # noqa: E501
             ("BTC-OPTION-1", 100, 1),
         )
         await option_repo.db.commit()
@@ -207,7 +209,7 @@ class TestOptionProgressRepo:
     async def test_update_option_last_no_increases(self, option_repo):
         """update_option_last_no should increase last_no with higher values."""
         await option_repo.db.execute(
-            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, 0)",
+            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, 0)",  # noqa: E501
             ("BTC-OPTION-1", 100, 1),
         )
         await option_repo.db.commit()
@@ -224,11 +226,11 @@ class TestOptionProgressRepo:
     async def test_get_incomplete_excludes_completed(self, option_repo):
         """get_incomplete_option_list should only return is_completed=0 instruments."""
         await option_repo.db.execute(
-            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, ?)",
+            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, ?)",  # noqa: E501
             ("BTC-OPTION-1", 5000, 0, 0),  # incomplete
         )
         await option_repo.db.execute(
-            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, ?)",
+            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, ?)",  # noqa: E501
             ("BTC-OPTION-2", 10000, 0, 1),  # completed
         )
         await option_repo.db.commit()
@@ -240,7 +242,7 @@ class TestOptionProgressRepo:
     async def test_resume_from_last_no(self, option_repo):
         """Resume should start from last_no + 1."""
         await option_repo.db.execute(
-            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, 0)",
+            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, 0)",  # noqa: E501
             ("BTC-OPTION-1", 5000, 1),
         )
         await option_repo.db.commit()
@@ -253,7 +255,7 @@ class TestOptionProgressRepo:
     async def test_mark_options_complete(self, option_repo):
         """mark_options_complete should set is_completed=1."""
         await option_repo.db.execute(
-            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, 0)",
+            "INSERT INTO option_meta (instrument, last_no, is_expired, is_completed) VALUES (?, ?, ?, 0)",  # noqa: E501
             ("BTC-OPTION-1", 5000, 1),
         )
         await option_repo.db.commit()

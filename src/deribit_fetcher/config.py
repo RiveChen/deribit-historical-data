@@ -1,5 +1,7 @@
-import os
+"""Application configuration loaded from environment variables."""
+
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +30,7 @@ class Config:
     PROXY: str | None = None
 
     def __post_init__(self):
+        """Override CURRENCY from environment and recompute paths."""
         # Override CURRENCY from environment if set
         env_currency = os.environ.get("CURRENCY")
         if env_currency:

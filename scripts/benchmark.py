@@ -1,6 +1,6 @@
-"""
-Benchmark harness for gen_parquet.py — turns README performance claims into
-real, reproducible numbers.
+"""Benchmark harness for gen_parquet.py.
+
+Turns README performance claims into real, reproducible numbers.
 
 It measures, for the ACTUAL code paths in scripts/gen_parquet.py:
   * throughput           — input rows/s and input MB/s
@@ -15,27 +15,11 @@ It measures, for the ACTUAL code paths in scripts/gen_parquet.py:
 Data source:
   --data-dir PATH   benchmark your REAL JSONL (best, most credible numbers)
   (default)         generate synthetic Deribit-like JSONL if no --data-dir
-
-Examples
---------
-# Quick synthetic smoke run (seconds):
-python scripts/benchmark.py --quick
-
-# Realistic synthetic run:
-python scripts/benchmark.py --small-files 300 --small-rows 8000 \
-                            --large-rows 3000000 --dup-rate 0.02
-
-# Benchmark your real downloaded data:
-python scripts/benchmark.py --data-dir data/BTC/option
-python scripts/benchmark.py --data-dir data/BTC/future --large-threshold-mb 100
-
-Outputs: prints a Markdown table and writes benchmark_results/{results.json,BENCHMARK.md}.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import multiprocessing as mp
 import os
 import platform
@@ -84,7 +68,7 @@ def _make_row(instr: str, seq: int, ts: int) -> dict:
     }
 
 
-def _write_jsonl(path: Path, instr: str, n_rows: int, dup_rate: float, rng: random.Random) -> tuple[int, int]:
+def _write_jsonl(path: Path, instr: str, n_rows: int, dup_rate: float, rng: random.Random) -> tuple[int, int]:  # noqa: E501
     """Write one instrument file with monotonic trade_seq.
 
     Duplicates simulate Deribit chunk-boundary overlap: a fraction of rows are
@@ -159,7 +143,7 @@ def scan_dir_stats(data_dir: Path) -> dict:
                 if not block:
                     break
                 rows += block.count(b"\n")
-    return {"input_rows": rows, "unique_rows": None, "input_bytes": input_bytes, "n_files": len(files)}
+    return {"input_rows": rows, "unique_rows": None, "input_bytes": input_bytes, "n_files": len(files)}  # noqa: E501
 
 
 # =============================================================================
@@ -167,12 +151,13 @@ def scan_dir_stats(data_dir: Path) -> dict:
 # =============================================================================
 
 
-def _case_worker(params: dict, q: "mp.Queue") -> None:
+def _case_worker(params: dict, q: mp.Queue) -> None:
     # Always put exactly one message so the parent never deadlocks, even on error.
     try:
         import resource  # POSIX only; peak RSS of THIS process
+
         import pyarrow.parquet as pq
-        from gen_parquet import generate_parquet  # noqa: import from scripts/
+        from gen_parquet import generate_parquet  # noqa: F401
 
         data_dir = Path(params["data_dir"])
         out_file = Path(params["out_file"])
@@ -197,13 +182,14 @@ def _case_worker(params: dict, q: "mp.Queue") -> None:
         # macOS reports bytes, Linux reports KB.
         peak_mb = peak_kb / (1024 * 1024) if sys.platform == "darwin" else peak_kb / 1024
 
-        q.put({"elapsed": elapsed, "out_bytes": out_bytes, "out_rows": out_rows, "peak_mb": peak_mb})
+        q.put({"elapsed": elapsed, "out_bytes": out_bytes, "out_rows": out_rows, "peak_mb": peak_mb})  # noqa: E501
     except Exception as e:  # noqa: BLE001
         import traceback
         q.put({"error": f"{e!r}", "trace": traceback.format_exc()})
 
 
 def run_case(label: str, params: dict, input_bytes: int, input_rows: int) -> dict:
+    """Run a single benchmark case in an isolated subprocess."""
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     p = ctx.Process(target=_case_worker, args=(params, q))
@@ -292,6 +278,7 @@ def build_matrix(args, threshold_bytes: int) -> list[tuple[str, dict]]:
 
 
 def render_markdown(env: dict, data_stats: dict, results: list[dict]) -> str:
+    """Render benchmark results as a Markdown table."""
     lines = []
     lines.append("# gen_parquet Benchmark Results\n")
     lines.append(
@@ -321,21 +308,22 @@ def render_markdown(env: dict, data_stats: dict, results: list[dict]) -> str:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data-dir", type=str, default=None, help="Benchmark real JSONL here instead of synthetic.")
+    """Entry point: parse args, generate or load data, run benchmark matrix, write results."""
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)  # noqa: E501
+    ap.add_argument("--data-dir", type=str, default=None, help="Benchmark real JSONL here instead of synthetic.")  # noqa: E501
     ap.add_argument("--quick", action="store_true", help="Tiny synthetic run for a smoke test.")
-    ap.add_argument("--small-files", type=int, default=200, help="Synthetic small (option-like) files.")
+    ap.add_argument("--small-files", type=int, default=200, help="Synthetic small (option-like) files.")  # noqa: E501
     ap.add_argument("--small-rows", type=int, default=5000, help="Rows per small file.")
-    ap.add_argument("--large-rows", type=int, default=800_000, help="Rows in the one large (perpetual-like) file; 0 to skip.")
-    ap.add_argument("--dup-rate", type=float, default=0.01, help="Fraction of duplicated rows (chunk-overlap simulation).")
-    ap.add_argument("--large-threshold-mb", type=float, default=100.0, help="Files >= this size use the streaming path.")
-    ap.add_argument("--stream-batch-size", type=int, default=200_000, help="Default streaming batch size (rows).")
-    ap.add_argument("--default-workers", type=int, default=min(8, os.cpu_count() or 4), help="Worker count for non-scaling cases.")
-    ap.add_argument("--out-dir", type=str, default="benchmark_results", help="Where to write results.")
+    ap.add_argument("--large-rows", type=int, default=800_000, help="Rows in the one large (perpetual-like) file; 0 to skip.")  # noqa: E501
+    ap.add_argument("--dup-rate", type=float, default=0.01, help="Fraction of duplicated rows (chunk-overlap simulation).")  # noqa: E501
+    ap.add_argument("--large-threshold-mb", type=float, default=100.0, help="Files >= this size use the streaming path.")  # noqa: E501
+    ap.add_argument("--stream-batch-size", type=int, default=200_000, help="Default streaming batch size (rows).")  # noqa: E501
+    ap.add_argument("--default-workers", type=int, default=min(8, os.cpu_count() or 4), help="Worker count for non-scaling cases.")  # noqa: E501
+    ap.add_argument("--out-dir", type=str, default="benchmark_results", help="Where to write results.")  # noqa: E501
     args = ap.parse_args()
 
     if args.quick:
-        args.small_files, args.small_rows, args.large_rows, args.large_threshold_mb = 20, 500, 40_000, 5.0
+        args.small_files, args.small_rows, args.large_rows, args.large_threshold_mb = 20, 500, 40_000, 5.0  # noqa: E501
 
     work = Path(args.out_dir)
     work.mkdir(parents=True, exist_ok=True)
@@ -395,7 +383,7 @@ def main() -> None:
     }
 
     (work / "results.json").write_bytes(
-        orjson.dumps({"env": env, "input": data_stats, "results": results}, option=orjson.OPT_INDENT_2)
+        orjson.dumps({"env": env, "input": data_stats, "results": results}, option=orjson.OPT_INDENT_2)  # noqa: E501
     )
     md = render_markdown(env, data_stats, results)
     (work / "BENCHMARK.md").write_text(md)

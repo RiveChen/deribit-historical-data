@@ -1,25 +1,25 @@
-import os
+"""JSONL storage sink for writing trade data to disk."""
+
 import asyncio
-import orjson
-from collections import defaultdict
 from pathlib import Path
+
+import orjson
 
 
 class JSONLinesSink:
-    """
-    A generic sink for writing chunks of JSON data to JSONL files.
+    """A generic sink for writing chunks of JSON data to JSONL files.
 
     Operates asynchronously by offloading disk I/O to a thread pool executor,
     keeping the event loop responsive during file writes.
     """
 
     def __init__(self, base_dir: Path):
+        """Initialize the sink with a base directory for output files."""
         self.base_dir = base_dir
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
     async def flush(self, data_buffers: dict[str, list[dict]]):
-        """
-        Flush in-memory buffers to disk.
+        """Flush in-memory buffers to disk.
 
         data_buffers maps instrument_name -> list of items,
         where each item has a "data" key containing a list of trade dicts.
@@ -41,6 +41,4 @@ class JSONLinesSink:
                         f.write(b"\n".join(lines) + b"\n")
 
         # Convert to a plain dict to detach from defaultdict references that might change
-        await asyncio.get_running_loop().run_in_executor(
-            None, sync_io_task, dict(data_buffers)
-        )
+        await asyncio.get_running_loop().run_in_executor(None, sync_io_task, dict(data_buffers))

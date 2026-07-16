@@ -1,18 +1,18 @@
 """Tests for storage.py: JSONLinesSink."""
 
-import asyncio
 import orjson
-from pathlib import Path
 import pytest
-from deribit_fetcher.storage import JSONLinesSink
 
+from deribit_fetcher.storage import JSONLinesSink
 
 pytestmark = pytest.mark.asyncio
 
 
 class TestJSONLinesSink:
+    """Test suite for JSONLinesSink."""
+
     async def test_flush_creates_file(self, tmp_path):
-        """flush should create a .jsonl file with the correct data."""
+        """Flush should create a .jsonl file with the correct data."""
         sink = JSONLinesSink(tmp_path)
         buffers = {
             "BTC-TEST": [
@@ -40,7 +40,7 @@ class TestJSONLinesSink:
         assert row2["trade_seq"] == 2
 
     async def test_flush_appends_to_existing(self, tmp_path):
-        """flush should append to an existing .jsonl file."""
+        """Flush should append to an existing .jsonl file."""
         sink = JSONLinesSink(tmp_path)
         # First flush
         await sink.flush(
@@ -59,20 +59,20 @@ class TestJSONLinesSink:
         assert orjson.loads(lines[1])["trade_seq"] == 2
 
     async def test_flush_empty_buffer(self, tmp_path):
-        """flush with empty buffer should not create any files."""
+        """Flush with empty buffer should not create any files."""
         sink = JSONLinesSink(tmp_path)
         await sink.flush({})
         assert len(list(tmp_path.iterdir())) == 0
 
     async def test_flush_empty_data(self, tmp_path):
-        """flush with items that have empty data should not create files."""
+        """Flush with items that have empty data should not create files."""
         sink = JSONLinesSink(tmp_path)
         await sink.flush({"BTC-TEST": [{"instrument": "BTC-TEST", "data": None}]})
         file_path = tmp_path / "BTC-TEST.jsonl"
         assert not file_path.exists()
 
     async def test_multiple_instruments(self, tmp_path):
-        """flush should create separate files for different instruments."""
+        """Flush should create separate files for different instruments."""
         sink = JSONLinesSink(tmp_path)
         await sink.flush(
             {

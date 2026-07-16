@@ -1,23 +1,29 @@
+"""Async HTTP client for the Deribit History API v2."""
+
 import asyncio
+
 import httpx
 from aiolimiter import AsyncLimiter
 from tenacity import (
-    retry,
-    wait_random_exponential,
-    stop_after_attempt,
-    retry_if_exception_type,
-    BaseRetrying,
     RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
 )
-from deribit_fetcher.config import settings, logger
+
+from deribit_fetcher.config import logger, settings
 
 
-# Custom wait strategy: prefer Deribit's Retry-After header, fall back to exponential backoff
 class DeribitRateLimitWait:
+    """Custom wait strategy preferring Retry-After header, falling back to exponential backoff."""
+
     def __init__(self, fallback_wait):
+        """Initialize with a fallback wait function."""
         self.fallback_wait = fallback_wait
 
     def __call__(self, retry_state: RetryCallState) -> float:
+        """Compute wait time, preferring server's Retry-After header."""
         if retry_state.outcome is None:
             return self.fallback_wait(retry_state)
 
@@ -45,6 +51,7 @@ class DeribitClient:
     """Async HTTP client for the Deribit History API v2."""
 
     def __init__(self):
+        """Initialize the client with rate limiter and HTTP session."""
         # Strict RPS limiter: max settings.MAX_RPS requests per second
         self.limiter = AsyncLimiter(settings.MAX_RPS, 1)
         self.client = self._create_client()
@@ -73,8 +80,8 @@ class DeribitClient:
         stop=stop_after_attempt(10),
         reraise=True,
         before_sleep=lambda retry_state: logger.warning(
-            f"Retrying {retry_state.fn.__name__} (Attempt {retry_state.attempt_number}): "
-            f"Next wait {retry_state.next_action.sleep}s"
+            f"Retrying (Attempt {retry_state.attempt_number}): "
+            f"Next wait {getattr(retry_state.next_action, 'sleep', 'unknown')}s"
         ),
     )
     async def _fetch(self, endpoint: str, params: dict):
@@ -129,6 +136,7 @@ class DeribitClient:
                    Callers MUST treat this as "unknown, retry next run" and must
                    NOT mark the instrument complete, otherwise a transient failure
                    would silently drop the instrument's entire history.
+
         """
         try:
             params = {"instrument_name": instrument, "count": 1}
@@ -153,11 +161,14 @@ class DeribitClient:
         return (data["result"]["trades"], data["result"]["has_more"])
 
     async def __aenter__(self):
+        """Enter async context manager."""
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Exit async context manager and close the HTTP client."""
         await self.client.aclose()
         logger.info("Deribit client closed.")
 
     async def close(self):
+        """Close the HTTP client explicitly."""
         await self.client.aclose()

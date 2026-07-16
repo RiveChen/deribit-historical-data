@@ -1,15 +1,17 @@
+"""Generic async producer-consumer engine for data fetching workloads."""
+
 import asyncio
-from collections import defaultdict
 from asyncio import Queue
-from collections.abc import Callable, Awaitable
+from collections import defaultdict
+from collections.abc import Awaitable, Callable
+
 from tqdm.asyncio import tqdm
-import typing
+
 from deribit_fetcher.config import logger
 
 
 class FetcherEngine:
-    """
-    Generic async producer-consumer engine for data fetching workloads.
+    """Generic async producer-consumer engine for data fetching workloads.
 
     Manages a task queue (producers fetch data) and a storage queue (consumer
     persists results). Supports graceful shutdown via an external stop_event.
@@ -22,6 +24,7 @@ class FetcherEngine:
         task_queue_size: int = 200,
         storage_queue_size: int = 80,
     ):
+        """Initialize the engine with concurrency and queue settings."""
         self.worker_count = worker_count
         self.write_batch_size = write_batch_size
         self.task_queue = Queue(maxsize=task_queue_size)
@@ -44,7 +47,7 @@ class FetcherEngine:
         pbar: tqdm,
         stop_event: asyncio.Event,
     ):
-        """Worker coroutine: pulls tasks from the queue, fetches data, enqueues results for storage."""
+        """Pull tasks from the queue, fetch data, and enqueue results for storage."""
         while not stop_event.is_set():
             try:
                 tasking = await asyncio.wait_for(self.task_queue.get(), timeout=1.0)
@@ -82,9 +85,9 @@ class FetcherEngine:
         pbar: tqdm,
         custom_pbar_updater: Callable[[dict, tqdm], None] | None = None,
     ):
-        """
-        Consumer coroutine: receives result items from producers, batches them
-        in memory, and flushes to storage/DB when the batch fills up.
+        """Receive result items from producers, batch them in memory, and flush to storage.
+
+        When the batch fills up, data is written to storage/DB.
         """
         buffers = defaultdict(list)
         total_buffered = 0
@@ -138,9 +141,10 @@ class FetcherEngine:
         pbar_desc: str = "Fetching",
         pbar_unit: str = "chunk",
     ):
-        """
-        Run the engine: distribute initial tasks, start producer and consumer
-        workers, and block until all tasks complete or stop_event is set.
+        """Run the engine: distribute tasks, start workers, and block until completion.
+
+        Distributes initial tasks, starts producer and consumer workers, and
+        blocks until all tasks complete or stop_event is set.
         """
         if not initial_tasks:
             logger.info("No tasks to run.")
@@ -158,9 +162,7 @@ class FetcherEngine:
         )
 
         workers = [
-            asyncio.create_task(
-                self._producer_worker(fetch_func, on_success, pbar, stop_event)
-            )
+            asyncio.create_task(self._producer_worker(fetch_func, on_success, pbar, stop_event))
             for _ in range(self.worker_count)
         ]
 

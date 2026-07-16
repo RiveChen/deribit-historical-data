@@ -1,10 +1,12 @@
+"""Logging utilities with tqdm-compatible output."""
+
 import logging
+
 from tqdm import tqdm
 
 
 class TqdmLoggingHandler(logging.Handler):
-    """
-    Logging handler compatible with tqdm progress bars.
+    """Logging handler compatible with tqdm progress bars.
 
     Uses tqdm.write() to print log messages, which temporarily pauses the
     progress bar, prints the message, and redraws the bar — avoiding visual
@@ -12,9 +14,11 @@ class TqdmLoggingHandler(logging.Handler):
     """
 
     def __init__(self, level=logging.NOTSET):
+        """Initialize the handler with the given log level."""
         super().__init__(level)
 
     def emit(self, record):
+        """Emit a log record using tqdm.write to avoid corrupting progress bars."""
         try:
             msg = self.format(record)
             tqdm.write(msg)

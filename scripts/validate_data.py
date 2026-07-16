@@ -1,5 +1,4 @@
-"""
-Post-download data integrity validation.
+"""Post-download data integrity validation.
 
 Validates generated Parquet files by checking trade_seq continuity for each
 instrument individually. For instruments with gaps, a histogram overlay shows
@@ -51,7 +50,7 @@ def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
                 # Map trade_seq to bucket via integer arithmetic:
                 # bucket = (trade_seq - seq_min) * N_BUCKETS // expected_total
                 # This avoids floating-point rounding issues entirely.
-                (
+
                     (pl.col("trade_seq") - seq_min)
                     .cast(pl.Int64)
                     .mul(N_BUCKETS)
@@ -60,7 +59,7 @@ def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
                     .cast(pl.UInt32)
                     .clip(0, N_BUCKETS - 1)
                     .alias("bucket")
-                )
+
             )
             .group_by("bucket")
             .len()
@@ -105,7 +104,7 @@ def validate_parquet(parquet_path: Path) -> None:
     # Schema info (metadata only — no data scan)
     schema = lf.collect_schema()
     print(f"Columns: {len(schema)}")
-    print(f"Schema:")
+    print("Schema:")
     for col, dtype in schema.items():
         print(f"  {col:25s}  {str(dtype):12s}")
 
@@ -183,6 +182,7 @@ def validate_parquet(parquet_path: Path) -> None:
 
 
 def main() -> None:
+    """Entry point: parse args and run validation."""
     parser = argparse.ArgumentParser(
         description="Validate generated Deribit trade Parquet files."
     )

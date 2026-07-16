@@ -1,14 +1,16 @@
+"""Future data fetcher — fetches historical trade data for futures instruments."""
+
 import asyncio
+
 from tqdm.asyncio import tqdm
 
 from deribit_fetcher import run_main
-from deribit_fetcher.progress import DatabaseClient, FutureProgressRepo
 from deribit_fetcher.client import DeribitClient
-from deribit_fetcher.config import settings, logger
-from deribit_fetcher.log import setup_logging
-from deribit_fetcher.storage import JSONLinesSink
+from deribit_fetcher.config import logger, settings
 from deribit_fetcher.engine import FetcherEngine
-
+from deribit_fetcher.log import setup_logging
+from deribit_fetcher.progress import DatabaseClient, FutureProgressRepo
+from deribit_fetcher.storage import JSONLinesSink
 
 MAX_WORKER_TASKS = 15
 WRITE_BATCH_SIZE = 1
@@ -18,12 +20,10 @@ TASK_QUEUE_SIZE = 200
 
 async def _fetch_all_sequences(incompleted_futures, deribit_client):
     """Fetch the latest trade_seq for each incomplete future in parallel."""
-    tasks = [
-        deribit_client.get_last_trade_seq(f["instrument"]) for f in incompleted_futures
-    ]
+    tasks = [deribit_client.get_last_trade_seq(f["instrument"]) for f in incompleted_futures]
     results = await tqdm.gather(*tasks, desc="Fetching last seq")
 
-    for future, seq in zip(incompleted_futures, results):
+    for future, seq in zip(incompleted_futures, results, strict=False):
         future["last_seq"] = seq
 
     return incompleted_futures
@@ -35,17 +35,14 @@ async def _prepare_tasks(
     refresh_list: bool = True,
     refresh_chunks: bool = True,
 ):
-    """
-    Prepare the task list for fetching.
+    """Prepare the task list for fetching.
 
     1. Upsert the instrument list from the API (if refresh_list)
     2. Get incomplete futures, fetch their last_seq, pre-allocate chunks (if refresh_chunks)
     3. Return the list of pending chunks to be fetched
     """
     if refresh_list:
-        futures = await deribit_client.get_instruments(
-            currency=settings.CURRENCY, kind="future"
-        )
+        futures = await deribit_client.get_instruments(currency=settings.CURRENCY, kind="future")
         await repo.upsert_future_list(futures)
 
     if refresh_chunks:
@@ -55,9 +52,7 @@ async def _prepare_tasks(
             return
         logger.info(f"Found {len(incompleted_futures)} incompleted futures.")
 
-        incompleted_futures = await _fetch_all_sequences(
-            incompleted_futures, deribit_client
-        )
+        incompleted_futures = await _fetch_all_sequences(incompleted_futures, deribit_client)
 
         # last_seq semantics (see DeribitClient.get_last_trade_seq):
         #   None -> could not determine this run; leave incomplete and retry next
@@ -76,9 +71,7 @@ async def _prepare_tasks(
         no_trade_futures = [f for f in incompleted_futures if f.get("last_seq") == 0]
         for f in no_trade_futures:
             await repo.mark_future_complete(f["instrument"])
-        todo_futures = [
-            f for f in incompleted_futures if (f.get("last_seq") or 0) > 0
-        ]
+        todo_futures = [f for f in incompleted_futures if (f.get("last_seq") or 0) > 0]
 
         # Pre-allocate chunks: partition [1, last_seq] into fixed-size ranges
         for f in todo_futures:
@@ -96,7 +89,7 @@ async def _prepare_tasks(
 
 
 async def run(stop_event: asyncio.Event):
-    """Main fetch routine for futures. Uses a producer-consumer engine for concurrent chunk fetching."""
+    """Fetch all future trades using a producer-consumer engine for concurrent chunk fetching."""
     setup_logging()
 
     async with DatabaseClient(settings.FUTURE_DB_PATH) as db_conn:
@@ -121,9 +114,7 @@ async def run(stop_event: asyncio.Event):
                 start_seq = tasking["chunk_no"]
                 end_seq = start_seq + settings.CHUNK_SIZE - 1
 
-                trades, has_more = await client.get_trades_chunk(
-                    instrument, start_seq, end_seq
-                )
+                trades, has_more = await client.get_trades_chunk(instrument, start_seq, end_seq)
                 return {
                     "instrument": instrument,
                     "chunk_no": start_seq,

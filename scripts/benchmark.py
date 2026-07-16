@@ -164,7 +164,8 @@ def _case_worker(params: dict, q: mp.Queue) -> None:
         import resource  # POSIX only; peak RSS of THIS process
 
         import pyarrow.parquet as pq
-        from gen_parquet import generate_parquet  # noqa: F401
+
+        from deribit_fetcher.parquet import generate_parquet  # noqa: F401
 
         data_dir = Path(params["data_dir"])
         out_file = Path(params["out_file"])

@@ -58,9 +58,9 @@ async def run(stop_event: asyncio.Event):
     """Fetch all option trades using streaming chunks via the on_success callback."""
     setup_logging()
 
-    async with DatabaseClient(settings.OPTION_DB_PATH) as db_conn:
+    async with DatabaseClient(settings.option_db_path) as db_conn:
         repo = OptionProgressRepo(db_conn)
-        sink = JSONLinesSink(settings.DATA_OPTION_DIR)
+        sink = JSONLinesSink(settings.data_option_dir)
 
         async with DeribitClient() as client:
             initial_tasks = await _prepare_initial_tasks(repo, client)

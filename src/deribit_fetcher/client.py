@@ -113,7 +113,7 @@ class DeribitClient:
 
         logger.info(f"Fetched {len(instruments)} {currency} {kind} instruments.")
 
-        save_dir = settings.BASE_DIR / kind
+        save_dir = settings.base_dir / kind
         save_dir.mkdir(parents=True, exist_ok=True)
         save_path = save_dir / "instruments.json"
 

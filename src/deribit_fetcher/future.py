@@ -102,9 +102,9 @@ async def run(stop_event: asyncio.Event):
     """Fetch all future trades using a producer-consumer engine for concurrent chunk fetching."""
     setup_logging()
 
-    async with DatabaseClient(settings.FUTURE_DB_PATH) as db_conn:
+    async with DatabaseClient(settings.future_db_path) as db_conn:
         repo = FutureProgressRepo(db_conn)
-        sink = JSONLinesSink(settings.DATA_FUTURE_DIR)
+        sink = JSONLinesSink(settings.data_future_dir)
 
         async with DeribitClient() as client:
             chunks = await _prepare_tasks(repo, client)

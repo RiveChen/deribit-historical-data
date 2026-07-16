@@ -21,13 +21,8 @@ def _clean_env(monkeypatch):
 class TestConfig:
     """Test suite for Config dataclass."""
 
-    def test_default_values(self, monkeypatch):
+    def test_default_values(self):
         """Config should have sensible defaults."""
-        monkeypatch.delenv("HTTP_PROXY", raising=False)
-        monkeypatch.delenv("HTTPS_PROXY", raising=False)
-        monkeypatch.delenv("http_proxy", raising=False)
-        monkeypatch.delenv("https_proxy", raising=False)
-        monkeypatch.delenv("CURRENCY", raising=False)
         c = Config()
         assert c.BASE_URL == "https://history.deribit.com/api/v2/public"
         assert c.CURRENCY == "BTC"
@@ -35,22 +30,23 @@ class TestConfig:
         assert c.MAX_RPS == 20
         assert c.MAX_WORKERS == 40
         assert c.PROXY is None
-        assert c.BASE_DIR == Path("./data/BTC")
-        assert c.DATA_FUTURE_DIR == Path("./data/BTC/future")
-        assert c.DATA_OPTION_DIR == Path("./data/BTC/option")
-        assert c.FUTURE_DB_PATH == Path("./data/BTC/future.db")
-        assert c.OPTION_DB_PATH == Path("./data/BTC/option.db")
+        # Derived path properties
+        assert c.base_dir == Path("./data/BTC")
+        assert c.data_future_dir == Path("./data/BTC/future")
+        assert c.data_option_dir == Path("./data/BTC/option")
+        assert c.future_db_path == Path("./data/BTC/future.db")
+        assert c.option_db_path == Path("./data/BTC/option.db")
 
     def test_proxy_from_http_env(self, monkeypatch):
         """HTTP_PROXY should be picked up."""
         monkeypatch.setenv("HTTP_PROXY", "http://proxy.example.com:8080")
-        c = Config()
+        c = Config.from_env()
         assert c.PROXY == "http://proxy.example.com:8080"
 
     def test_proxy_from_https_env(self, monkeypatch):
         """HTTPS_PROXY should be picked up."""
         monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:8443")
-        c = Config()
+        c = Config.from_env()
         assert c.PROXY == "http://proxy.example.com:8443"
 
     def test_proxy_lowercase_fallback(self, monkeypatch):
@@ -58,20 +54,20 @@ class TestConfig:
         monkeypatch.delenv("HTTP_PROXY", raising=False)
         monkeypatch.delenv("HTTPS_PROXY", raising=False)
         monkeypatch.setenv("http_proxy", "http://lowercase.proxy:8080")
-        c = Config()
+        c = Config.from_env()
         assert c.PROXY == "http://lowercase.proxy:8080"
 
     def test_proxy_strips_whitespace(self, monkeypatch):
         """Proxy value should have whitespace stripped."""
         monkeypatch.setenv("HTTP_PROXY", "  http://proxy.com:8080  ")
-        c = Config()
+        c = Config.from_env()
         assert c.PROXY == "http://proxy.com:8080"
 
     def test_proxy_precedence(self, monkeypatch):
         """HTTP_PROXY should take precedence over http_proxy."""
         monkeypatch.setenv("HTTP_PROXY", "http://upper.proxy:8080")
         monkeypatch.setenv("http_proxy", "http://lower.proxy:8080")
-        c = Config()
+        c = Config.from_env()
         assert c.PROXY == "http://upper.proxy:8080"
 
     def test_currency_from_env(self, monkeypatch):
@@ -81,19 +77,19 @@ class TestConfig:
         monkeypatch.delenv("http_proxy", raising=False)
         monkeypatch.delenv("https_proxy", raising=False)
         monkeypatch.setenv("CURRENCY", "ETH")
-        c = Config()
+        c = Config.from_env()
         assert c.CURRENCY == "ETH"
-        assert c.BASE_DIR == Path("./data/ETH")
-        assert c.DATA_FUTURE_DIR == Path("./data/ETH/future")
-        assert c.DATA_OPTION_DIR == Path("./data/ETH/option")
-        assert c.FUTURE_DB_PATH == Path("./data/ETH/future.db")
-        assert c.OPTION_DB_PATH == Path("./data/ETH/option.db")
+        assert c.base_dir == Path("./data/ETH")
+        assert c.data_future_dir == Path("./data/ETH/future")
+        assert c.data_option_dir == Path("./data/ETH/option")
+        assert c.future_db_path == Path("./data/ETH/future.db")
+        assert c.option_db_path == Path("./data/ETH/option.db")
 
     def test_currency_env_strips_whitespace(self, monkeypatch):
         """CURRENCY value should have whitespace stripped."""
         monkeypatch.delenv("HTTP_PROXY", raising=False)
         monkeypatch.delenv("HTTPS_PROXY", raising=False)
         monkeypatch.setenv("CURRENCY", "  ETH  ")
-        c = Config()
+        c = Config.from_env()
         assert c.CURRENCY == "ETH"
-        assert c.BASE_DIR == Path("./data/ETH")
+        assert c.base_dir == Path("./data/ETH")

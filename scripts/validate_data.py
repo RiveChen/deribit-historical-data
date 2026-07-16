@@ -50,16 +50,14 @@ def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
                 # Map trade_seq to bucket via integer arithmetic:
                 # bucket = (trade_seq - seq_min) * N_BUCKETS // expected_total
                 # This avoids floating-point rounding issues entirely.
-
-                    (pl.col("trade_seq") - seq_min)
-                    .cast(pl.Int64)
-                    .mul(N_BUCKETS)
-                    .truediv(expected_total)
-                    .floor()
-                    .cast(pl.UInt32)
-                    .clip(0, N_BUCKETS - 1)
-                    .alias("bucket")
-
+                (pl.col("trade_seq") - seq_min)
+                .cast(pl.Int64)
+                .mul(N_BUCKETS)
+                .truediv(expected_total)
+                .floor()
+                .cast(pl.UInt32)
+                .clip(0, N_BUCKETS - 1)
+                .alias("bucket")
             )
             .group_by("bucket")
             .len()
@@ -69,10 +67,9 @@ def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
         # Build a lookup: bucket -> actual row count
         counts_map = dict(bucket_counts.iter_rows())
 
-        print(f"\n{instr_name} — {gap_total:,} gaps "
-              f"(expected {expected_total:,}, got {count:,})")
+        print(f"\n{instr_name} — {gap_total:,} gaps (expected {expected_total:,}, got {count:,})")
         print(f"  {'Bucket':>8s}  {'Rows':>10s}  {'Expected':>10s}  {'Deficit':>10s}")
-        print(f"  {'─'*8}  {'─'*10}  {'─'*10}  {'─'*10}")
+        print(f"  {'─' * 8}  {'─' * 10}  {'─' * 10}  {'─' * 10}")
 
         for b in range(N_BUCKETS):
             b_rows = counts_map.get(b, 0)
@@ -83,10 +80,7 @@ def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
                 marker = " ⚠️"
             else:
                 marker = "   "
-            print(
-                f"  {b + 1:>8d}  {b_rows:>10,}  {b_expected:>10,}  "
-                f"{deficit:>+10,}{marker}"
-            )
+            print(f"  {b + 1:>8d}  {b_rows:>10,}  {b_expected:>10,}  {deficit:>+10,}{marker}")
 
 
 def validate_parquet(parquet_path: Path) -> None:
@@ -155,9 +149,7 @@ def validate_parquet(parquet_path: Path) -> None:
             status = "✅"
             ok_count += 1
 
-        print(
-            f"{instr:35s} {count:>10,} {seq_min:>12,}..{seq_max:<12,} {status:20s}"
-        )
+        print(f"{instr:35s} {count:>10,} {seq_min:>12,}..{seq_max:<12,} {status:20s}")
 
     # Pass 2: gap histogram for instruments with gaps
     if gapped_instruments:
@@ -166,12 +158,8 @@ def validate_parquet(parquet_path: Path) -> None:
     # File size
     size_mb = parquet_path.stat().st_size / (1024 * 1024)
 
-    t_min = datetime.fromtimestamp(
-        int(ts_min_global) / 1000, tz=timezone.utc
-    ).strftime("%Y-%m-%d")
-    t_max = datetime.fromtimestamp(
-        int(ts_max_global) / 1000, tz=timezone.utc
-    ).strftime("%Y-%m-%d")
+    t_min = datetime.fromtimestamp(int(ts_min_global) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    t_max = datetime.fromtimestamp(int(ts_max_global) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
 
     print(f"\n{'=' * 80}")
     print(f"Total rows: {total_rows:,}")
@@ -183,9 +171,7 @@ def validate_parquet(parquet_path: Path) -> None:
 
 def main() -> None:
     """Entry point: parse args and run validation."""
-    parser = argparse.ArgumentParser(
-        description="Validate generated Deribit trade Parquet files."
-    )
+    parser = argparse.ArgumentParser(description="Validate generated Deribit trade Parquet files.")
     parser.add_argument(
         "--type",
         type=str,
@@ -201,9 +187,9 @@ def main() -> None:
 
     for data_type in types:
         if data_type == "future":
-            parquet_file = settings.BASE_DIR / "future.parquet"
+            parquet_file = settings.base_dir / "future.parquet"
         else:
-            parquet_file = settings.BASE_DIR / "option.parquet"
+            parquet_file = settings.base_dir / "option.parquet"
 
         validate_parquet(parquet_file)
 

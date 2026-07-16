@@ -445,11 +445,11 @@ def main() -> None:
     data_type = args.type
     input_dir: Path
     if data_type == "future":
-        input_dir = settings.DATA_FUTURE_DIR
+        input_dir = settings.data_future_dir
     else:
-        input_dir = settings.DATA_OPTION_DIR
+        input_dir = settings.data_option_dir
 
-    output_file = settings.BASE_DIR / f"{data_type}.parquet"
+    output_file = settings.base_dir / f"{data_type}.parquet"
 
     logger.info(f"Starting Parquet generation for {data_type.upper()} data...")
     generate_parquet(

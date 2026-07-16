@@ -6,6 +6,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
+def _resolve_proxy() -> str | None:
+    """Resolve proxy from environment (try uppercase and lowercase variants)."""
+    proxy = (
+        os.environ.get("HTTP_PROXY")
+        or os.environ.get("HTTPS_PROXY")
+        or os.environ.get("http_proxy")
+        or os.environ.get("https_proxy")
+    )
+    return proxy.strip() if proxy else None
+
+
 @dataclass
 class Config:
     """Application configuration loaded from environment variables."""
@@ -15,13 +26,6 @@ class Config:
     CURRENCY: str = "BTC"
     CHUNK_SIZE: int = 10000
 
-    # Paths
-    BASE_DIR: Path = Path("./data") / CURRENCY
-    DATA_FUTURE_DIR: Path = BASE_DIR / "future"
-    DATA_OPTION_DIR: Path = BASE_DIR / "option"
-    FUTURE_DB_PATH: Path = BASE_DIR / "future.db"
-    OPTION_DB_PATH: Path = BASE_DIR / "option.db"
-
     # Concurrency & Limits
     MAX_RPS: int = 20
     MAX_WORKERS: int = 40
@@ -29,33 +33,46 @@ class Config:
     # Network
     PROXY: str | None = None
 
-    def __post_init__(self):
-        """Override CURRENCY from environment and recompute paths."""
-        # Override CURRENCY from environment if set
-        env_currency = os.environ.get("CURRENCY")
-        if env_currency:
-            self.CURRENCY = env_currency.strip()
+    # --- derived path properties ---
 
-        # Recompute paths based on actual CURRENCY value
-        # (BASE_DIR and derivatives are computed at class definition time,
-        #  so they must be recalculated here to reflect env var overrides)
-        self.BASE_DIR = Path("./data") / self.CURRENCY
-        self.DATA_FUTURE_DIR = self.BASE_DIR / "future"
-        self.DATA_OPTION_DIR = self.BASE_DIR / "option"
-        self.FUTURE_DB_PATH = self.BASE_DIR / "future.db"
-        self.OPTION_DB_PATH = self.BASE_DIR / "option.db"
+    @property
+    def base_dir(self) -> Path:
+        """Root data directory based on current CURRENCY."""
+        return Path("./data") / self.CURRENCY
 
-        # Resolve proxy from environment (try uppercase and lowercase variants)
-        self.PROXY = (
-            os.environ.get("HTTP_PROXY")
-            or os.environ.get("HTTPS_PROXY")
-            or os.environ.get("http_proxy")
-            or os.environ.get("https_proxy")
-        )
-        if self.PROXY:
-            self.PROXY = self.PROXY.strip()
+    @property
+    def data_future_dir(self) -> Path:
+        """Directory for future JSONL files."""
+        return self.base_dir / "future"
+
+    @property
+    def data_option_dir(self) -> Path:
+        """Directory for option JSONL files."""
+        return self.base_dir / "option"
+
+    @property
+    def future_db_path(self) -> Path:
+        """SQLite database path for future progress tracking."""
+        return self.base_dir / "future.db"
+
+    @property
+    def option_db_path(self) -> Path:
+        """SQLite database path for option progress tracking."""
+        return self.base_dir / "option.db"
+
+    @classmethod
+    def from_env(cls) -> "Config":
+        """Factory: read environment variables and return a Config instance.
+
+        Reads CURRENCY, HTTP_PROXY / HTTPS_PROXY / http_proxy / https_proxy
+        from the environment. All other fields keep their default values.
+        """
+        currency = os.environ.get("CURRENCY", "").strip()
+        if not currency:
+            currency = "BTC"
+        return cls(CURRENCY=currency, PROXY=_resolve_proxy())
 
 
 logger = logging.getLogger("Deribit Fetcher")
 
-settings = Config()
+settings = Config.from_env()

@@ -1,6 +1,7 @@
 """Future data fetcher — fetches historical trade data for futures instruments."""
 
 import asyncio
+from typing import Protocol
 
 from tqdm.asyncio import tqdm
 
@@ -11,6 +12,15 @@ from deribit_fetcher.engine import FetcherEngine
 from deribit_fetcher.log import setup_logging
 from deribit_fetcher.progress import DatabaseClient, FutureProgressRepo
 from deribit_fetcher.storage import JSONLinesSink
+
+
+class _ClientProtocol(Protocol):
+    """Protocol defining the minimal client interface needed by _prepare_tasks."""
+
+    async def get_instruments(self, currency: str, kind: str) -> list: ...
+
+    async def get_last_trade_seq(self, instrument: str) -> int | None: ...
+
 
 MAX_WORKER_TASKS = 15
 WRITE_BATCH_SIZE = 1
@@ -31,7 +41,7 @@ async def _fetch_all_sequences(incompleted_futures, deribit_client):
 
 async def _prepare_tasks(
     repo: FutureProgressRepo,
-    deribit_client: DeribitClient,
+    deribit_client: _ClientProtocol,
     refresh_list: bool = True,
     refresh_chunks: bool = True,
 ):

@@ -1,7 +1,0 @@
-# Pyrefly Configuration
-
-# Directories to analyze
-include = ["src"]
-
-# Target Python version
-python-version = "3.10"

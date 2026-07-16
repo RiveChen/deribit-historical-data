@@ -68,7 +68,9 @@ def _make_row(instr: str, seq: int, ts: int) -> dict:
     }
 
 
-def _write_jsonl(path: Path, instr: str, n_rows: int, dup_rate: float, rng: random.Random) -> tuple[int, int]:  # noqa: E501
+def _write_jsonl(
+    path: Path, instr: str, n_rows: int, dup_rate: float, rng: random.Random
+) -> tuple[int, int]:  # noqa: E501
     """Write one instrument file with monotonic trade_seq.
 
     Duplicates simulate Deribit chunk-boundary overlap: a fraction of rows are
@@ -143,7 +145,12 @@ def scan_dir_stats(data_dir: Path) -> dict:
                 if not block:
                     break
                 rows += block.count(b"\n")
-    return {"input_rows": rows, "unique_rows": None, "input_bytes": input_bytes, "n_files": len(files)}  # noqa: E501
+    return {
+        "input_rows": rows,
+        "unique_rows": None,
+        "input_bytes": input_bytes,
+        "n_files": len(files),
+    }  # noqa: E501
 
 
 # =============================================================================
@@ -182,9 +189,12 @@ def _case_worker(params: dict, q: mp.Queue) -> None:
         # macOS reports bytes, Linux reports KB.
         peak_mb = peak_kb / (1024 * 1024) if sys.platform == "darwin" else peak_kb / 1024
 
-        q.put({"elapsed": elapsed, "out_bytes": out_bytes, "out_rows": out_rows, "peak_mb": peak_mb})  # noqa: E501
+        q.put(
+            {"elapsed": elapsed, "out_bytes": out_bytes, "out_rows": out_rows, "peak_mb": peak_mb}
+        )  # noqa: E501
     except Exception as e:  # noqa: BLE001
         import traceback
+
         q.put({"error": f"{e!r}", "trace": traceback.format_exc()})
 
 
@@ -207,17 +217,27 @@ def run_case(label: str, params: dict, input_bytes: int, input_rows: int) -> dic
         if res.get("trace"):
             print(res["trace"])
         return {
-            "case": label, "workers": params["workers"], "dedup": params["dedup"],
+            "case": label,
+            "workers": params["workers"],
+            "dedup": params["dedup"],
             "codec": "lz4" if params["fast"] else "zstd",
             "stream_batch_size": params["stream_batch_size"],
-            "wall_s": 0, "in_rows_per_s": 0, "in_mb_per_s": 0, "out_rows": 0,
-            "in_mb": round(input_bytes / (1024 * 1024), 1), "out_mb": 0,
-            "compression_x": 0, "peak_rss_mb": 0, "error": res["error"],
+            "wall_s": 0,
+            "in_rows_per_s": 0,
+            "in_mb_per_s": 0,
+            "out_rows": 0,
+            "in_mb": round(input_bytes / (1024 * 1024), 1),
+            "out_mb": 0,
+            "compression_x": 0,
+            "peak_rss_mb": 0,
+            "error": res["error"],
         }
 
-    elapsed = res["elapsed"]
+    elapsed: float = float(res["elapsed"])
     in_mb = input_bytes / (1024 * 1024)
-    out_mb = res["out_bytes"] / (1024 * 1024)
+    out_mb: float = float(res["out_bytes"]) / (1024 * 1024)
+    out_rows: int = int(res["out_rows"])
+    peak_mb: float = float(res["peak_mb"])
     return {
         "case": label,
         "workers": params["workers"],
@@ -227,11 +247,11 @@ def run_case(label: str, params: dict, input_bytes: int, input_rows: int) -> dic
         "wall_s": round(elapsed, 3),
         "in_rows_per_s": int(input_rows / elapsed) if elapsed else 0,
         "in_mb_per_s": round(in_mb / elapsed, 1) if elapsed else 0,
-        "out_rows": res["out_rows"],
+        "out_rows": out_rows,
         "in_mb": round(in_mb, 1),
         "out_mb": round(out_mb, 2),
         "compression_x": round(in_mb / out_mb, 2) if out_mb else 0,
-        "peak_rss_mb": round(res["peak_mb"], 1),
+        "peak_rss_mb": round(peak_mb, 1),
     }
 
 
@@ -289,7 +309,7 @@ def render_markdown(env: dict, data_stats: dict, results: list[dict]) -> str:
     lines.append(
         f"**Input:** {data_stats['n_files']:,} JSONL files · "
         f"{data_stats['input_rows']:,} rows · "
-        f"{data_stats['input_bytes'] / (1024*1024):.1f} MB ({src})\n"
+        f"{data_stats['input_bytes'] / (1024 * 1024):.1f} MB ({src})\n"
     )
     lines.append("| Case | Wall (s) | Rows/s | MB/s in | Parquet MB | Compress× | Peak RSS MB |")
     lines.append("|------|---------:|-------:|--------:|-----------:|----------:|------------:|")
@@ -309,21 +329,59 @@ def render_markdown(env: dict, data_stats: dict, results: list[dict]) -> str:
 
 def main() -> None:
     """Entry point: parse args, generate or load data, run benchmark matrix, write results."""
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)  # noqa: E501
-    ap.add_argument("--data-dir", type=str, default=None, help="Benchmark real JSONL here instead of synthetic.")  # noqa: E501
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )  # noqa: E501
+    ap.add_argument(
+        "--data-dir", type=str, default=None, help="Benchmark real JSONL here instead of synthetic."
+    )  # noqa: E501
     ap.add_argument("--quick", action="store_true", help="Tiny synthetic run for a smoke test.")
-    ap.add_argument("--small-files", type=int, default=200, help="Synthetic small (option-like) files.")  # noqa: E501
+    ap.add_argument(
+        "--small-files", type=int, default=200, help="Synthetic small (option-like) files."
+    )  # noqa: E501
     ap.add_argument("--small-rows", type=int, default=5000, help="Rows per small file.")
-    ap.add_argument("--large-rows", type=int, default=800_000, help="Rows in the one large (perpetual-like) file; 0 to skip.")  # noqa: E501
-    ap.add_argument("--dup-rate", type=float, default=0.01, help="Fraction of duplicated rows (chunk-overlap simulation).")  # noqa: E501
-    ap.add_argument("--large-threshold-mb", type=float, default=100.0, help="Files >= this size use the streaming path.")  # noqa: E501
-    ap.add_argument("--stream-batch-size", type=int, default=200_000, help="Default streaming batch size (rows).")  # noqa: E501
-    ap.add_argument("--default-workers", type=int, default=min(8, os.cpu_count() or 4), help="Worker count for non-scaling cases.")  # noqa: E501
-    ap.add_argument("--out-dir", type=str, default="benchmark_results", help="Where to write results.")  # noqa: E501
+    ap.add_argument(
+        "--large-rows",
+        type=int,
+        default=800_000,
+        help="Rows in the one large (perpetual-like) file; 0 to skip.",
+    )  # noqa: E501
+    ap.add_argument(
+        "--dup-rate",
+        type=float,
+        default=0.01,
+        help="Fraction of duplicated rows (chunk-overlap simulation).",
+    )  # noqa: E501
+    ap.add_argument(
+        "--large-threshold-mb",
+        type=float,
+        default=100.0,
+        help="Files >= this size use the streaming path.",
+    )  # noqa: E501
+    ap.add_argument(
+        "--stream-batch-size",
+        type=int,
+        default=200_000,
+        help="Default streaming batch size (rows).",
+    )  # noqa: E501
+    ap.add_argument(
+        "--default-workers",
+        type=int,
+        default=min(8, os.cpu_count() or 4),
+        help="Worker count for non-scaling cases.",
+    )  # noqa: E501
+    ap.add_argument(
+        "--out-dir", type=str, default="benchmark_results", help="Where to write results."
+    )  # noqa: E501
     args = ap.parse_args()
 
     if args.quick:
-        args.small_files, args.small_rows, args.large_rows, args.large_threshold_mb = 20, 500, 40_000, 5.0  # noqa: E501
+        args.small_files, args.small_rows, args.large_rows, args.large_threshold_mb = (
+            20,
+            500,
+            40_000,
+            5.0,
+        )  # noqa: E501
 
     work = Path(args.out_dir)
     work.mkdir(parents=True, exist_ok=True)
@@ -354,7 +412,7 @@ def main() -> None:
 
     print(
         f"Input ready: {data_stats['n_files']} files, {data_stats['input_rows']:,} rows, "
-        f"{data_stats['input_bytes'] / (1024*1024):.1f} MB\n"
+        f"{data_stats['input_bytes'] / (1024 * 1024):.1f} MB\n"
     )
 
     # --- run matrix ------------------------------------------------------
@@ -383,13 +441,15 @@ def main() -> None:
     }
 
     (work / "results.json").write_bytes(
-        orjson.dumps({"env": env, "input": data_stats, "results": results}, option=orjson.OPT_INDENT_2)  # noqa: E501
+        orjson.dumps(
+            {"env": env, "input": data_stats, "results": results}, option=orjson.OPT_INDENT_2
+        )  # noqa: E501
     )
     md = render_markdown(env, data_stats, results)
     (work / "BENCHMARK.md").write_text(md)
 
     print("\n" + md)
-    print(f"\nWrote {work/'results.json'} and {work/'BENCHMARK.md'}")
+    print(f"\nWrote {work / 'results.json'} and {work / 'BENCHMARK.md'}")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ Performance characteristics:
 - Bottleneck (small files): CPU (zstd compression); use --fast for lz4.
 - Bottleneck (large files): NDJSON line-by-line parsing; mitigated by streaming batches.
 """
+
 import argparse
 import concurrent.futures
 import io
@@ -211,12 +212,8 @@ def generate_parquet(
     compression = "lz4" if fast else "zstd"
 
     logger.info(f"Found {n_total} JSONL files in {data_dir}")
-    logger.info(
-        f"  - {n_small} small files  -> thread pool ({effective_workers} workers)"
-    )
-    logger.info(
-        f"  - {n_large} large files -> stream batches ({stream_batch_size} rows)"
-    )
+    logger.info(f"  - {n_small} small files  -> thread pool ({effective_workers} workers)")
+    logger.info(f"  - {n_large} large files -> stream batches ({stream_batch_size} rows)")
     logger.info(f"Merging into {output_file}... (compression={compression})")
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -236,19 +233,18 @@ def generate_parquet(
         processed_count = 0
 
         def _flush_pending() -> None:
-            nonlocal pending
+            nonlocal pending, writer
             if not pending:
                 return
             combined = pa.concat_tables(pending)
-            writer.write_table(combined)  # type: ignore[union-attr]
+            assert writer is not None
+            writer.write_table(combined)
             pending.clear()
 
         def _init_writer(table: pa.Table) -> None:
             nonlocal writer
             if writer is None:
-                writer = pq.ParquetWriter(
-                    output_file, table.schema, compression=compression
-                )
+                writer = pq.ParquetWriter(output_file, table.schema, compression=compression)
 
         # ═══════════════════════════════════════════════════════════════
         # Phase 1 - large files (streaming, main thread)
@@ -270,9 +266,7 @@ def generate_parquet(
                         leave=False,
                     ) as inner_pbar:
                         last_pos = 0
-                        for fname, df, intra, instr, pos in _stream_batches(
-                            f, stream_batch_size
-                        ):
+                        for fname, df, intra, instr, pos in _stream_batches(f, stream_batch_size):
                             total_duplicates += intra
 
                             if df.is_empty():
@@ -284,10 +278,7 @@ def generate_parquet(
                                 max_seen = max_seqs.get(instr, -1)
                                 if max_seen >= 0:
                                     before = len(df)
-                                    df = df.filter(
-                                        pl.col("trade_seq").cast(pl.Int64)
-                                        > max_seen
-                                    )
+                                    df = df.filter(pl.col("trade_seq").cast(pl.Int64) > max_seen)
                                     cross_dup = before - len(df)
                                     if cross_dup:
                                         logger.debug(
@@ -346,16 +337,10 @@ def generate_parquet(
                     seen_seqs = prev_keys.get(instr_name)
                     if seen_seqs:
                         before = len(df)
-                        df = df.filter(
-                            ~pl.col("trade_seq")
-                            .cast(pl.Int64)
-                            .is_in(seen_seqs)
-                        )
+                        df = df.filter(~pl.col("trade_seq").cast(pl.Int64).is_in(seen_seqs))
                         cross_dup = before - len(df)
                         if cross_dup:
-                            logger.debug(
-                                f"{fname}: removed {cross_dup} cross-file dups"
-                            )
+                            logger.debug(f"{fname}: removed {cross_dup} cross-file dups")
                         total_duplicates += cross_dup
 
                     if instr_name in prev_keys:
@@ -377,13 +362,8 @@ def generate_parquet(
                 ):
                     _flush_pending()
 
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=effective_workers
-            ) as executor:
-                futures = {
-                    executor.submit(_read_and_dedup_file, f): f
-                    for f in small_files
-                }
+            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+                futures = {executor.submit(_read_and_dedup_file, f): f for f in small_files}
 
                 with tqdm(
                     total=n_small,

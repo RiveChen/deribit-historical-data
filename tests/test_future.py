@@ -23,6 +23,10 @@ class FakeClient:
         self.seq_map = seq_map
         self.calls: list[str] = []
 
+    async def get_instruments(self, currency: str, kind: str) -> list:
+        """Stub implementation returning an empty list."""
+        return []
+
     async def get_last_trade_seq(self, instrument: str) -> int | None:
         """Return the pre-configured last trade seq for the given instrument."""
         self.calls.append(instrument)

@@ -6,26 +6,97 @@ from typing import Protocol
 from tqdm.asyncio import tqdm
 
 from deribit_fetcher import run_main
-from deribit_fetcher.client import DeribitClient
 from deribit_fetcher.config import logger, settings
-from deribit_fetcher.engine import FetcherEngine
-from deribit_fetcher.log import setup_logging
-from deribit_fetcher.progress import DatabaseClient, FutureProgressRepo
-from deribit_fetcher.storage import JSONLinesSink
+from deribit_fetcher.fetcher import run_fetcher
+from deribit_fetcher.progress import FutureProgressRepo
 
 
 class _ClientProtocol(Protocol):
     """Protocol defining the minimal client interface needed by _prepare_tasks."""
 
     async def get_instruments(self, currency: str, kind: str) -> list: ...
-
     async def get_last_trade_seq(self, instrument: str) -> int | None: ...
 
 
+class _FetchClientProtocol(Protocol):
+    """Protocol for the client methods used by fetch_future_chunk."""
+
+    async def get_trades_chunk(
+        self, instrument: str, start_seq: int, end_seq: int
+    ) -> tuple[list, bool]: ...  # noqa: E501
+
+
+class _SyncSinkProtocol(Protocol):
+    """Protocol for the sink interface used by sync_future_db."""
+
+    async def flush(self, buffers: dict[str, list[dict]]) -> None: ...
+
+
+class _SyncRepoProtocol(Protocol):
+    """Protocol for the repo interface used by sync_future_db."""
+
+    async def update_chunks(self, chunks: list[tuple[int, bool, str, int]]) -> None: ...
+
+
+# Engine constants — shared with option via config if needed later
 MAX_WORKER_TASKS = 15
 WRITE_BATCH_SIZE = 1
 STORAGE_QUEUE_SIZE = 50
 TASK_QUEUE_SIZE = 200
+
+
+# ---------------------------------------------------------------------------
+# Module-level callbacks (extracted from closures for testability)
+# ---------------------------------------------------------------------------
+
+
+async def fetch_future_chunk(tasking: dict, *, client: _FetchClientProtocol) -> dict:
+    """Fetch a single chunk of future trades and return it with metadata."""
+    instrument = tasking["instrument"]
+    start_seq = tasking["chunk_no"]
+    end_seq = start_seq + settings.CHUNK_SIZE - 1
+
+    trades, has_more = await client.get_trades_chunk(instrument, start_seq, end_seq)
+    return {
+        "instrument": instrument,
+        "chunk_no": start_seq,
+        "has_more": has_more,
+        "data": trades if trades else None,
+    }
+
+
+async def sync_future_db(
+    buffers: dict[str, list[dict]],
+    *,
+    sink: _SyncSinkProtocol,
+    repo: _SyncRepoProtocol,
+) -> None:
+    """Flush data to disk and update chunk progress."""
+    await sink.flush(buffers)
+    db_updates = []
+    for items in buffers.values():
+        for item in items:
+            db_updates.append(
+                (
+                    len(item["data"]) if item.get("data") else 0,
+                    item["has_more"],
+                    item["instrument"],
+                    item["chunk_no"],
+                )
+            )
+    await repo.update_chunks(db_updates)
+    logger.debug(f"Flushed {len(db_updates)} chunks.")
+
+
+async def finalize_future(repo: FutureProgressRepo) -> None:
+    """Mark completed chunks and instruments so they're skipped on restart."""
+    await repo.finalize_chunks()
+    await repo.finalize_future_meta()
+
+
+# ---------------------------------------------------------------------------
+# Task preparation
+# ---------------------------------------------------------------------------
 
 
 async def _fetch_all_sequences(incompleted_futures, deribit_client):
@@ -39,7 +110,7 @@ async def _fetch_all_sequences(incompleted_futures, deribit_client):
     return incompleted_futures
 
 
-async def _prepare_tasks(
+async def prepare_future_tasks(
     repo: FutureProgressRepo,
     deribit_client: _ClientProtocol,
     refresh_list: bool = True,
@@ -98,68 +169,30 @@ async def _prepare_tasks(
     return pending_chunks
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
 async def run(stop_event: asyncio.Event):
     """Fetch all future trades using a producer-consumer engine for concurrent chunk fetching."""
-    setup_logging()
-
-    async with DatabaseClient(settings.future_db_path) as db_conn:
-        repo = FutureProgressRepo(db_conn)
-        sink = JSONLinesSink(settings.data_future_dir)
-
-        async with DeribitClient() as client:
-            chunks = await _prepare_tasks(repo, client)
-            if stop_event.is_set() or not chunks:
-                return
-
-            engine = FetcherEngine(
-                worker_count=MAX_WORKER_TASKS,
-                write_batch_size=WRITE_BATCH_SIZE,
-                task_queue_size=TASK_QUEUE_SIZE,
-                storage_queue_size=STORAGE_QUEUE_SIZE,
-            )
-
-            async def fetch_chunk(tasking: dict) -> dict:
-                """Fetch a single chunk of trades and return it with metadata."""
-                instrument = tasking["instrument"]
-                start_seq = tasking["chunk_no"]
-                end_seq = start_seq + settings.CHUNK_SIZE - 1
-
-                trades, has_more = await client.get_trades_chunk(instrument, start_seq, end_seq)
-                return {
-                    "instrument": instrument,
-                    "chunk_no": start_seq,
-                    "has_more": has_more,
-                    "data": trades if trades else None,
-                }
-
-            async def sync_db(buffers: dict[str, list[dict]]):
-                """Flush data to disk and update chunk progress."""
-                await sink.flush(buffers)
-                db_updates = []
-                for items in buffers.values():
-                    for item in items:
-                        db_updates.append(
-                            (
-                                len(item["data"]) if item.get("data") else 0,
-                                item["has_more"],
-                                item["instrument"],
-                                item["chunk_no"],
-                            )
-                        )
-                await repo.update_chunks(db_updates)
-                logger.debug(f"Flushed {len(db_updates)} chunks.")
-
-            await engine.run(
-                initial_tasks=chunks,
-                fetch_func=fetch_chunk,
-                sync_db_func=sync_db,
-                stop_event=stop_event,
-                pbar_desc="Downloading Trades",
-            )
-
-            # Finalize: mark completed chunks and instruments so they're skipped on restart
-            await repo.finalize_chunks()
-            await repo.finalize_future_meta()
+    await run_fetcher(
+        db_path=settings.future_db_path,
+        data_dir=settings.data_future_dir,
+        repo_cls=FutureProgressRepo,
+        prepare_fn=prepare_future_tasks,
+        fetch_fn=fetch_future_chunk,
+        sync_fn=sync_future_db,
+        stop_event=stop_event,
+        finalize_fn=finalize_future,
+        engine_kwargs={
+            "worker_count": MAX_WORKER_TASKS,
+            "write_batch_size": WRITE_BATCH_SIZE,
+            "task_queue_size": TASK_QUEUE_SIZE,
+            "storage_queue_size": STORAGE_QUEUE_SIZE,
+        },
+        pbar_desc="Downloading Trades",
+    )
 
 
 async def main():

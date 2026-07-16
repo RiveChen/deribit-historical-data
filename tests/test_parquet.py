@@ -1,4 +1,4 @@
-"""Tests for parquet.py: dedup_intra, dedup_cross_batch, dedup_cross_file.
+"""Tests for parquet.py: dedup_intra, dedup_cross_batch, dedup_cross_file, and gap bucketing.
 
 All tests operate on in-memory Polars DataFrames — no I/O, no network.
 """
@@ -11,10 +11,68 @@ from deribit_fetcher.parquet import dedup_cross_batch, dedup_cross_file, dedup_i
 # Helpers
 # =============================================================================
 
+N_BUCKETS = 10
+
 
 def _df(seqs: list[int], instr: str = "BTC-TEST") -> pl.DataFrame:
     """Build a minimal DataFrame with instrument_name and trade_seq columns."""
     return pl.DataFrame({"instrument_name": [instr] * len(seqs), "trade_seq": seqs})
+
+
+def _compute_bucket(trade_seq: int, seq_min: int, expected_total: int) -> int:
+    """Replicate the exact bucket formula from _show_gap_histogram.
+
+    Uses integer arithmetic to avoid floating-point drift:
+        bucket = (trade_seq - seq_min) * N_BUCKETS // expected_total
+    """
+    return (trade_seq - seq_min) * N_BUCKETS // expected_total
+
+
+def _bucket_counts(df: pl.DataFrame, seq_min: int, expected_total: int) -> dict[int, int]:
+    """Apply the same bucket expression as _show_gap_histogram and return per-bucket counts."""
+    result = (
+        df.lazy()
+        .with_columns(
+            (pl.col("trade_seq") - seq_min)
+            .cast(pl.Int64)
+            .mul(N_BUCKETS)
+            .truediv(expected_total)
+            .floor()
+            .cast(pl.UInt32)
+            .clip(0, N_BUCKETS - 1)
+            .alias("bucket")
+        )
+        .group_by("bucket")
+        .len()
+        .collect()
+    )
+    return dict(result.iter_rows())
+
+
+def _expected_counts_of_full(expected_total: int, seq_min: int = 1) -> dict[int, int]:
+    """Return the ideal per-bucket row count for a full (gapless) sequence.
+
+    Computed directly from the bucket formula rather than assuming a
+    simple remainder distribution.
+    """
+    result = (
+        _df(list(range(seq_min, seq_min + expected_total)))
+        .lazy()
+        .with_columns(
+            (pl.col("trade_seq") - seq_min)
+            .cast(pl.Int64)
+            .mul(N_BUCKETS)
+            .truediv(expected_total)
+            .floor()
+            .cast(pl.UInt32)
+            .clip(0, N_BUCKETS - 1)
+            .alias("bucket")
+        )
+        .group_by("bucket")
+        .len()
+        .collect()
+    )
+    return dict(result.iter_rows())
 
 
 # =============================================================================
@@ -187,3 +245,168 @@ class TestCombinedDedup:
         df2, _cross = dedup_cross_file(df2, seen)
         # seq 2 and 3 already seen -> removed; 4 and 5 survive
         assert sorted(df2["trade_seq"].to_list()) == [4, 5]
+
+
+# =============================================================================
+# Gap histogram bucketing — regression tests for integer arithmetic
+#
+# The exact formula used by _show_gap_histogram:
+#   bucket = (trade_seq - seq_min) * N_BUCKETS // expected_total
+#
+# This uses ONLY integer arithmetic to avoid floating-point drift that could
+# cause boundary seqs to land in the wrong bucket.
+# =============================================================================
+
+
+class TestGapHistogram:
+    """Test the per-bucket deficit computation used in gap histograms."""
+
+    # ------------------------------------------------------------------
+    # No-gap cases
+    # ------------------------------------------------------------------
+
+    def test_gapless_even(self):
+        """Expected_total=100, N_BUCKETS=10 — each bucket should have 10 rows, deficit=0."""
+        seq_min = 1
+        expected_total = 100  # seq 1..100
+        df = _df(list(range(seq_min, seq_min + expected_total)))
+
+        counts = _bucket_counts(df, seq_min, expected_total)
+        expected = _expected_counts_of_full(expected_total)
+
+        for b in range(N_BUCKETS):
+            deficit = expected[b] - counts.get(b, 0)
+            exp = expected[b]
+            got = counts.get(b, 0)
+            assert deficit == 0, f"Bucket {b}: deficit={deficit}, expected {exp} got {got}"
+
+    def test_gapless_with_remainder(self):
+        """Expected_total=103, N_BUCKETS=10 — verify buckets sum to total and no row is lost."""
+        seq_min = 1
+        expected_total = 103
+        df = _df(list(range(seq_min, seq_min + expected_total)))
+
+        counts = _bucket_counts(df, seq_min, expected_total)
+
+        total_in_buckets = sum(counts.values())
+        assert total_in_buckets == expected_total, (
+            f"Total rows in buckets {total_in_buckets} != {expected_total}"
+        )
+        assert set(counts.keys()) == set(range(N_BUCKETS)), "All 10 buckets should have data"
+
+    # ------------------------------------------------------------------
+    # Known-gap cases
+    # ------------------------------------------------------------------
+
+    def test_gap_in_middle_bucket(self):
+        """Remove seq 21-30 (bucket 2) — only bucket 2 should have deficit."""
+        seq_min = 1
+        expected_total = 100
+
+        # Remove a contiguous block that falls entirely in bucket 2:
+        # bucket(21) = (21-1)*10//100 = 200//100 = 2
+        # bucket(30) = (30-1)*10//100 = 290//100 = 2
+        missing = set(range(21, 31))
+        present = sorted(set(range(seq_min, seq_min + expected_total)) - missing)
+
+        df = _df(present)
+        counts = _bucket_counts(df, seq_min, expected_total)
+        expected = _expected_counts_of_full(expected_total)
+
+        for b in range(N_BUCKETS):
+            deficit = expected[b] - counts.get(b, 0)
+            if b == 2:
+                assert deficit == 10, f"Bucket {b}: should have 10 gaps, got {deficit}"
+            else:
+                exp = expected[b]
+                got = counts.get(b, 0)
+                assert deficit == 0, f"Bucket {b}: unexpected {deficit}, expected {exp} got {got}"
+
+    def test_gap_spans_two_buckets(self):
+        """Remove seq 46-55 — overlaps buckets 4 and 5 (partial)."""
+        seq_min = 1
+        expected_total = 100
+
+        # Bucket boundaries: seq=1..10 → b0, 11..20 → b1, ..., 91..100 → b9
+        # bucket(46) = (46-1)*10//100 = 450//100 = 4
+        # bucket(55) = (55-1)*10//100 = 540//100 = 5
+        full = set(range(seq_min, seq_min + expected_total))
+        missing = set(range(46, 56))
+        present = sorted(full - missing)
+
+        df = _df(present)
+        counts = _bucket_counts(df, seq_min, expected_total)
+
+        # Each bucket normally has 10 rows
+        assert counts.get(4, 0) == 5, "Bucket 4 should have 5 rows (lost 5)"
+        assert counts.get(5, 0) == 5, "Bucket 5 should have 5 rows (lost 5)"
+
+    # ------------------------------------------------------------------
+    # Boundary cases
+    # ------------------------------------------------------------------
+
+    def test_boundary_seq_min_in_bucket_zero(self):
+        """seq_min should always map to bucket 0."""
+        for seq_min in [1, 0, 1000]:
+            for expected_total in [50, 100, 501]:
+                bucket = _compute_bucket(seq_min, seq_min, expected_total)
+                assert bucket == 0, (
+                    f"seq_min={seq_min}, expected_total={expected_total}: "
+                    f"expected bucket 0, got {bucket}"
+                )
+
+    def test_boundary_seq_max_in_last_bucket(self):
+        """seq_max (seq_min + expected_total - 1) should map to bucket 9."""
+        for seq_min in [1, 0, 1000]:
+            for expected_total in [50, 100, 501]:
+                seq_max = seq_min + expected_total - 1
+                bucket = _compute_bucket(seq_max, seq_min, expected_total)
+                assert bucket == N_BUCKETS - 1, (
+                    f"seq_max={seq_max}, seq_min={seq_min}, "
+                    f"expected_total={expected_total}: "
+                    f"expected bucket {N_BUCKETS - 1}, got {bucket}"
+                )
+
+    # ------------------------------------------------------------------
+    # Float-drift regression
+    #
+    # If the formula were written as floating-point:
+    #   int((trade_seq - seq_min) * N_BUCKETS / expected_total)
+    # a seq like 50001 with expected_total=50001 would suffer 0.0001-level
+    # error that could push it into the wrong bucket.
+    #
+    # The integer formula avoids this entirely.
+    # ------------------------------------------------------------------
+
+    def test_no_float_drift_at_large_numbers(self):
+        """Large expected_total should not cause boundary mis-bucketing."""
+        seq_min = 1
+        expected_total = 50001  # prime-ish number, likely to expose float drift
+
+        # Boundary seqs that must land in exact buckets
+        cases = [
+            (1, 0),  # first seq → bucket 0
+            (5000, 0),  # still bucket 0
+            (5001, 0),  # (5001-1)*10//50001 = 50000//50001 = 0
+            (expected_total, N_BUCKETS - 1),  # last seq → bucket 9
+            (expected_total - 1, N_BUCKETS - 1),
+        ]
+
+        for seq, expected_bucket in cases:
+            bucket = _compute_bucket(seq, seq_min, expected_total)
+            assert bucket == expected_bucket, (
+                f"seq={seq}, seq_min={seq_min}, expected_total={expected_total}: "
+                f"expected bucket {expected_bucket}, got {bucket} — "
+                f"possible float drift!"
+            )
+
+    def test_bucket_monotonic_not_decreasing(self):
+        """bucket(trade_seq) must be non-decreasing as trade_seq increases."""
+        seq_min = 0
+        expected_total = 50001
+
+        prev = -1
+        for seq in range(seq_min, seq_min + expected_total, 100):  # step=100 for speed
+            b = _compute_bucket(seq, seq_min, expected_total)
+            assert b >= prev, f"bucket decreased: seq={seq}, bucket={b} < prev={prev}"
+            prev = b

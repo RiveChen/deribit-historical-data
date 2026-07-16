@@ -8,7 +8,11 @@ from pathlib import Path
 
 from deribit_fetcher.config import settings
 from deribit_fetcher.log import setup_logging
-from deribit_fetcher.parquet import BATCH_SIZE, generate_parquet
+from deribit_fetcher.parquet import (
+    BATCH_SIZE,
+    DEFAULT_BLOCK_BYTES,
+    generate_parquet,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +57,20 @@ def main() -> None:
         default=BATCH_SIZE,
         help=f"Rows per streaming batch for large files (default: {BATCH_SIZE}).",
     )
+    parser.add_argument(
+        "--stream-workers",
+        type=int,
+        default=0,
+        help="Parallel worker count for large-file block reading "
+        "(0 = single-threaded streaming; default: 0).",
+    )
+    parser.add_argument(
+        "--block-bytes",
+        type=int,
+        default=DEFAULT_BLOCK_BYTES,
+        help=f"Block size in bytes for parallel large-file reading "
+        f"(default: {DEFAULT_BLOCK_BYTES}).",
+    )
 
     args = parser.parse_args()
     setup_logging()
@@ -75,6 +93,8 @@ def main() -> None:
         fast=args.fast,
         large_file_threshold=int(args.large_threshold_mb * 1024 * 1024),
         stream_batch_size=args.stream_batch_size,
+        stream_workers=args.stream_workers,
+        block_bytes=args.block_bytes,
     )
     logger.info("Done.")
 

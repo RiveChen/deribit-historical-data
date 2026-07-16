@@ -1,11 +1,23 @@
-"""Tests for parquet.py: dedup_intra, dedup_cross_batch, dedup_cross_file, and gap bucketing.
+"""Tests for parquet.py: dedup functions, gap bucketing, and parallel reading.
 
 All tests operate on in-memory Polars DataFrames — no I/O, no network.
 """
 
-import polars as pl
+import os
+import tempfile
+from pathlib import Path
 
-from deribit_fetcher.parquet import dedup_cross_batch, dedup_cross_file, dedup_intra
+import polars as pl
+import pytest
+
+from deribit_fetcher.parquet import (
+    _split_blocks,
+    dedup_cross_batch,
+    dedup_cross_file,
+    dedup_intra,
+    parallel_read_large_file,
+    stream_batches,
+)
 
 # =============================================================================
 # Helpers
@@ -50,11 +62,7 @@ def _bucket_counts(df: pl.DataFrame, seq_min: int, expected_total: int) -> dict[
 
 
 def _expected_counts_of_full(expected_total: int, seq_min: int = 1) -> dict[int, int]:
-    """Return the ideal per-bucket row count for a full (gapless) sequence.
-
-    Computed directly from the bucket formula rather than assuming a
-    simple remainder distribution.
-    """
+    """Return the ideal per-bucket row count for a full (gapless) sequence."""
     result = (
         _df(list(range(seq_min, seq_min + expected_total)))
         .lazy()
@@ -228,52 +236,35 @@ class TestCombinedDedup:
 
     def test_intra_then_cross_file(self):
         """Simulate small-file pipeline: intra-dedup first, then cross-file."""
-        # File 1 has a duplicate row
         df1 = _df([1, 2, 2, 3])  # seq 2 duplicated
-        df1, _intra = dedup_intra(df1)  # -> [1, 2, 3]
+        df1, _intra = dedup_intra(df1)
 
-        # Cross-file: seen keys from previous files
         seen: set[int] = set()
         df1, _cross = dedup_cross_file(df1, seen)
         seen.update(df1["trade_seq"].to_list())
-        # First file: nothing to cross-dedup against
         assert sorted(df1["trade_seq"].to_list()) == [1, 2, 3]
 
-        # File 2: some seqs already seen
         df2 = _df([2, 3, 4, 5])
         df2, _intra = dedup_intra(df2)
         df2, _cross = dedup_cross_file(df2, seen)
-        # seq 2 and 3 already seen -> removed; 4 and 5 survive
         assert sorted(df2["trade_seq"].to_list()) == [4, 5]
 
 
 # =============================================================================
 # Gap histogram bucketing — regression tests for integer arithmetic
-#
-# The exact formula used by _show_gap_histogram:
-#   bucket = (trade_seq - seq_min) * N_BUCKETS // expected_total
-#
-# This uses ONLY integer arithmetic to avoid floating-point drift that could
-# cause boundary seqs to land in the wrong bucket.
 # =============================================================================
 
 
 class TestGapHistogram:
     """Test the per-bucket deficit computation used in gap histograms."""
 
-    # ------------------------------------------------------------------
-    # No-gap cases
-    # ------------------------------------------------------------------
-
     def test_gapless_even(self):
         """Expected_total=100, N_BUCKETS=10 — each bucket should have 10 rows, deficit=0."""
         seq_min = 1
-        expected_total = 100  # seq 1..100
+        expected_total = 100
         df = _df(list(range(seq_min, seq_min + expected_total)))
-
         counts = _bucket_counts(df, seq_min, expected_total)
         expected = _expected_counts_of_full(expected_total)
-
         for b in range(N_BUCKETS):
             deficit = expected[b] - counts.get(b, 0)
             exp = expected[b]
@@ -285,34 +276,22 @@ class TestGapHistogram:
         seq_min = 1
         expected_total = 103
         df = _df(list(range(seq_min, seq_min + expected_total)))
-
         counts = _bucket_counts(df, seq_min, expected_total)
-
         total_in_buckets = sum(counts.values())
         assert total_in_buckets == expected_total, (
             f"Total rows in buckets {total_in_buckets} != {expected_total}"
         )
         assert set(counts.keys()) == set(range(N_BUCKETS)), "All 10 buckets should have data"
 
-    # ------------------------------------------------------------------
-    # Known-gap cases
-    # ------------------------------------------------------------------
-
     def test_gap_in_middle_bucket(self):
         """Remove seq 21-30 (bucket 2) — only bucket 2 should have deficit."""
         seq_min = 1
         expected_total = 100
-
-        # Remove a contiguous block that falls entirely in bucket 2:
-        # bucket(21) = (21-1)*10//100 = 200//100 = 2
-        # bucket(30) = (30-1)*10//100 = 290//100 = 2
         missing = set(range(21, 31))
         present = sorted(set(range(seq_min, seq_min + expected_total)) - missing)
-
         df = _df(present)
         counts = _bucket_counts(df, seq_min, expected_total)
         expected = _expected_counts_of_full(expected_total)
-
         for b in range(N_BUCKETS):
             deficit = expected[b] - counts.get(b, 0)
             if b == 2:
@@ -326,24 +305,13 @@ class TestGapHistogram:
         """Remove seq 46-55 — overlaps buckets 4 and 5 (partial)."""
         seq_min = 1
         expected_total = 100
-
-        # Bucket boundaries: seq=1..10 → b0, 11..20 → b1, ..., 91..100 → b9
-        # bucket(46) = (46-1)*10//100 = 450//100 = 4
-        # bucket(55) = (55-1)*10//100 = 540//100 = 5
         full = set(range(seq_min, seq_min + expected_total))
         missing = set(range(46, 56))
         present = sorted(full - missing)
-
         df = _df(present)
         counts = _bucket_counts(df, seq_min, expected_total)
-
-        # Each bucket normally has 10 rows
         assert counts.get(4, 0) == 5, "Bucket 4 should have 5 rows (lost 5)"
         assert counts.get(5, 0) == 5, "Bucket 5 should have 5 rows (lost 5)"
-
-    # ------------------------------------------------------------------
-    # Boundary cases
-    # ------------------------------------------------------------------
 
     def test_boundary_seq_min_in_bucket_zero(self):
         """seq_min should always map to bucket 0."""
@@ -367,31 +335,17 @@ class TestGapHistogram:
                     f"expected bucket {N_BUCKETS - 1}, got {bucket}"
                 )
 
-    # ------------------------------------------------------------------
-    # Float-drift regression
-    #
-    # If the formula were written as floating-point:
-    #   int((trade_seq - seq_min) * N_BUCKETS / expected_total)
-    # a seq like 50001 with expected_total=50001 would suffer 0.0001-level
-    # error that could push it into the wrong bucket.
-    #
-    # The integer formula avoids this entirely.
-    # ------------------------------------------------------------------
-
     def test_no_float_drift_at_large_numbers(self):
         """Large expected_total should not cause boundary mis-bucketing."""
         seq_min = 1
-        expected_total = 50001  # prime-ish number, likely to expose float drift
-
-        # Boundary seqs that must land in exact buckets
+        expected_total = 50001
         cases = [
-            (1, 0),  # first seq → bucket 0
-            (5000, 0),  # still bucket 0
-            (5001, 0),  # (5001-1)*10//50001 = 50000//50001 = 0
-            (expected_total, N_BUCKETS - 1),  # last seq → bucket 9
+            (1, 0),
+            (5000, 0),
+            (5001, 0),
+            (expected_total, N_BUCKETS - 1),
             (expected_total - 1, N_BUCKETS - 1),
         ]
-
         for seq, expected_bucket in cases:
             bucket = _compute_bucket(seq, seq_min, expected_total)
             assert bucket == expected_bucket, (
@@ -404,9 +358,126 @@ class TestGapHistogram:
         """bucket(trade_seq) must be non-decreasing as trade_seq increases."""
         seq_min = 0
         expected_total = 50001
-
         prev = -1
-        for seq in range(seq_min, seq_min + expected_total, 100):  # step=100 for speed
+        for seq in range(seq_min, seq_min + expected_total, 100):
             b = _compute_bucket(seq, seq_min, expected_total)
             assert b >= prev, f"bucket decreased: seq={seq}, bucket={b} < prev={prev}"
             prev = b
+
+
+# =============================================================================
+# Parallel reading — ProcessPoolExecutor block splitting and correctness
+# =============================================================================
+
+
+class TestSplitBlocks:
+    r"""Test _split_blocks which divides a file into \\n-aligned byte ranges."""
+
+    def test_single_line(self):
+        """A single-line file produces one block."""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            f.write('{"trade_seq":1,"instrument_name":"BTC-TEST"}\n')
+            tmp = Path(f.name)
+        try:
+            blocks = _split_blocks(tmp, 10)
+            assert len(blocks) == 1
+            assert blocks[0][0] == 0, "Should start at offset 0"
+            assert blocks[0][1] > 0, "Should cover the entire file"
+        finally:
+            os.unlink(tmp)
+
+    def test_split_at_exact_newline(self):
+        r"""When block_bytes aligns exactly with \\n boundaries, should split cleanly."""
+        with tempfile.NamedTemporaryFile(mode="wb", delete=False) as f:
+            # Each line is about 70 bytes, write 5 lines
+            for i in range(1, 6):
+                f.write(b'{"trade_seq":%d,"instrument_name":"BTC-TEST","price":50000.0}\n' % i)
+            tmp = Path(f.name)
+        try:
+            # small block_bytes so we get multiple blocks
+            blocks = _split_blocks(tmp, 100)
+            assert len(blocks) >= 2, "Should split into at least 2 blocks"
+            # each block's start is 0 (file start) or follows a \n
+            for start, _end in blocks:
+                if start > 0:
+                    with open(tmp, "rb") as fh:
+                        fh.seek(start - 1)
+                        prev_byte = fh.read(1)
+                        assert prev_byte == b"\n", (
+                            f"Block at offset {start} should follow a newline"
+                        )
+        finally:
+            os.unlink(tmp)
+
+    def test_empty_file(self):
+        """An empty file produces no blocks."""
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as f:
+            tmp = Path(f.name)
+        try:
+            blocks = _split_blocks(tmp, 10)
+            assert blocks == []
+        finally:
+            os.unlink(tmp)
+
+
+class TestParallelRead:
+    """Parallel reading should produce the same result as serial streaming."""
+
+    @pytest.fixture
+    def jsonl_file(self):
+        """Create a temp JSONL file suitable for dedup tests."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+            # Write trades with monotonic seq; include some intentional intra-file dups
+            instr = "BTC-TEST"
+            for seq in range(1, 51):
+                f.write(
+                    f'{{"trade_seq":{seq},"instrument_name":"{instr}","price":50000,"timestamp":1}}\n'  # noqa: UP031
+                )
+            for seq in (5, 10, 15):
+                f.write(
+                    f'{{"trade_seq":{seq},"instrument_name":"{instr}","price":50000,"timestamp":1}}\n'  # noqa: UP031
+                )
+            tmp = Path(f.name)
+        yield tmp
+        os.unlink(tmp)
+
+    def _collect(self, gen):
+        """Helper: iterate a generator and return sorted trade_seqs."""
+        all_seqs = []
+        for _fname, df, _intra, _instr, _pos in gen:
+            if df is not None and not df.is_empty():
+                all_seqs.extend(df["trade_seq"].to_list())
+        return sorted(all_seqs)
+
+    def test_parallel_matches_serial(self, jsonl_file):
+        """Parallel reading must produce the same unique deduped seq set as serial streaming."""
+        # stream_batches only does intra-batch dedup; parallel does cross-block too.
+        # Compare unique seqs which must match.
+        serial_unique = []
+        for _fname, df, _intra, _instr, _pos in stream_batches(jsonl_file, batch_size=10):
+            if df is not None and not df.is_empty():
+                serial_unique.extend(df["trade_seq"].to_list())
+        serial_set = set(serial_unique)
+
+        parallel_unique = []
+        for _fname, df, _intra, _instr, _pos in parallel_read_large_file(
+            jsonl_file, block_bytes=200, workers=2
+        ):
+            if df is not None and not df.is_empty():
+                parallel_unique.extend(df["trade_seq"].to_list())
+        parallel_set = set(parallel_unique)
+
+        assert serial_set == parallel_set, "Unique seqs from parallel and serial must match"
+        assert len(parallel_unique) == 50, f"Expected 50 unique, got {len(parallel_unique)}"
+
+    def test_parallel_dedup_no_dupes(self, jsonl_file):
+        """Parallel reading should deduplicate all intra-file duplicates."""
+        all_seqs = []
+        for _fname, df, _intra, _instr, _pos in parallel_read_large_file(
+            jsonl_file, block_bytes=200, workers=2
+        ):
+            if df is not None and not df.is_empty():
+                all_seqs.extend(df["trade_seq"].to_list())
+        # After intra + cross-block dedup, we should have exactly 50 unique seqs
+        assert len(all_seqs) == 50, f"Expected 50 unique seqs, got {len(all_seqs)}"
+        assert sorted(all_seqs) == list(range(1, 51)), "Should have seq 1..50"

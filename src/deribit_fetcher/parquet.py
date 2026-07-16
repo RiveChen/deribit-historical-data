@@ -8,6 +8,7 @@ import concurrent.futures
 import io
 import logging
 import mmap
+import multiprocessing as mp
 import os
 from collections.abc import Generator
 from datetime import datetime, timezone
@@ -53,6 +54,8 @@ COMPREHENSIVE_SCHEMA = pl.Schema(
 BATCH_SIZE = 200_000
 MAX_PENDING_TABLES = 50
 LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100 MB
+DEFAULT_BLOCK_BYTES = 100 * 1024 * 1024  # 100 MB per block for parallel reading
+DEFAULT_STREAM_WORKERS = 4
 
 
 # ---------------------------------------------------------------------------
@@ -122,14 +125,129 @@ def read_and_dedup_file(
 
 
 # ---------------------------------------------------------------------------
-# Worker: large files  (streaming, main thread)
+# Worker: large files — parallel reading with ProcessPoolExecutor
 #
-# Uses mmap for zero-copy batch splitting — finds batch boundaries via
-# ``find(b'\n')`` and hands each chunk directly to ``pl.read_ndjson``
-# without per-line Python decode/append overhead.
-#
-# trade_seq within a single file is monotonic, so cross-batch dedup simply
-# filters "trade_seq <= max_seen" — no need for a set or is_in.
+# A large file is split into \n-aligned byte blocks; each block is processed
+# in a separate subprocess (true parallelism, not GIL-bound).  Results are
+# sorted by block offset to restore file order before cross-block dedup.
+# ---------------------------------------------------------------------------
+
+
+def _split_blocks(file_path: Path, block_bytes: int) -> list[tuple[int, int]]:
+    r"""Split a file into \n-aligned byte ranges.
+
+    Each block starts at a \n boundary (first complete line) so that no worker
+    receives a partial line.  Returns list of (start_offset, end_offset).
+    """
+    size = file_path.stat().st_size
+    if size == 0:
+        return []
+
+    blocks: list[tuple[int, int]] = []
+    start = 0
+    while start < size:
+        end = min(start + block_bytes, size)
+        if end < size:
+            # Rewind to next \n so the block starts at a line boundary.
+            # We search forward from end (not backward) to find the break point.
+            with open(file_path, "rb") as f:
+                f.seek(end)
+                # Read up to 1 MB looking for \n
+                chunk = f.read(min(1024 * 1024, size - end))
+                nl = chunk.find(b"\n")
+                if nl != -1:
+                    end = end + nl + 1
+                else:
+                    # No newline found in lookahead — this IS the last block
+                    end = size
+        blocks.append((start, end))
+        start = end
+    return blocks
+
+
+def _process_block(args: tuple) -> tuple[int, pl.DataFrame | None, int, str | None]:
+    """Worker function for ProcessPoolExecutor: read one byte block and dedup.
+
+    This is a module-level function (required for pickling across processes).
+    """
+    file_path, start, end = args
+    try:
+        with open(file_path, "rb") as f:
+            f.seek(start)
+            chunk = f.read(end - start)
+
+        # _split_blocks guarantees block boundaries are \n-aligned, so every
+        # chunk starts at a complete line.  No need to strip a partial line.
+        if not chunk.strip():
+            return (start, None, 0, None)
+
+        df = pl.read_ndjson(io.BytesIO(chunk), schema=COMPREHENSIVE_SCHEMA)
+        if df.is_empty():
+            return (start, None, 0, None)
+
+        df, intra_dup = dedup_intra(df)
+        instr_name = str(df["instrument_name"][0])
+        return (start, df, intra_dup, instr_name)
+
+    except Exception as e:
+        logger.error(f"Error processing block [{start}:{end}): {e}")
+        return (start, None, 0, None)
+
+
+def parallel_read_large_file(
+    file_path: Path,
+    block_bytes: int = DEFAULT_BLOCK_BYTES,
+    workers: int = DEFAULT_STREAM_WORKERS,
+) -> Generator[tuple[str, pl.DataFrame, int, str | None, int], None, None]:
+    r"""Read a large JSONL file in parallel using a process pool.
+
+    Splits the file into \n-aligned blocks, processes each in a subprocess,
+    then yields results in file-order (by block offset) with cross-block
+    dedup applied.
+
+    Yields same format as stream_batches: (filename, df, intra_dup, instr_name, pos).
+    """
+    blocks = _split_blocks(file_path, block_bytes)
+    if not blocks:
+        return
+
+    fname = file_path.name
+
+    # Process blocks — use spawn context for Linux/macOS safety
+    ctx = mp.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+        args = [(file_path, start, end) for start, end in blocks]
+        results = list(pool.map(_process_block, args))
+
+    # Sort by block start offset to restore file order
+    results.sort(key=lambda r: r[0])
+
+    # Cross-block dedup as we yield (monotonic seq within file)
+    max_seen = -1
+
+    for start_offset, df, intra_dup, instr in results:
+        if df is None or df.is_empty():
+            continue
+
+        if max_seen >= 0:
+            df, cross_dup = dedup_cross_batch(df, max_seen)
+            if cross_dup:
+                logger.debug(
+                    f"{fname}[block offset={start_offset}]: removed {cross_dup} cross-block dups"
+                )
+            if df.is_empty():
+                continue
+
+        # Track max_seen for next block's dedup
+        batch_max = df.select(pl.col("trade_seq").cast(pl.Int64).max()).item()
+        if batch_max is not None and batch_max > max_seen:
+            max_seen = batch_max
+
+        yield (fname, df, intra_dup, instr, start_offset)
+
+
+# ---------------------------------------------------------------------------
+# Worker: large files  (streaming, main thread) — unchanged single-thread fallback
 # ---------------------------------------------------------------------------
 
 
@@ -209,11 +327,17 @@ def generate_parquet(
     fast: bool = False,
     large_file_threshold: int = LARGE_FILE_THRESHOLD,
     stream_batch_size: int = BATCH_SIZE,
+    stream_workers: int = 0,
+    block_bytes: int = DEFAULT_BLOCK_BYTES,
 ) -> None:
     """Merge JSONL files in data_dir into a single Parquet file.
 
     Detects small and large files, processes them accordingly, deduplicates
     intra-file and cross-file, and writes the result to output_file.
+
+    When stream_workers > 0, large files are read in parallel using a process
+    pool (true parallelism, not GIL-bound).  Otherwise the single-threaded
+    mmap-based streaming path is used.
     """
     if not data_dir.exists():
         logger.error(f"Data directory not found: {data_dir}")
@@ -233,8 +357,13 @@ def generate_parquet(
     compression = "lz4" if fast else "zstd"
 
     logger.info(f"Found {n_total} JSONL files in {data_dir}")
-    logger.info(f"  - {n_small} small files  -> thread pool ({effective_workers} workers)")
-    logger.info(f"  - {n_large} large files -> stream batches ({stream_batch_size} rows)")
+    if effective_workers:
+        logger.info(f"  - {n_small} small files  -> thread pool ({effective_workers} workers)")
+    if stream_workers:
+        eff_workers = stream_workers
+        logger.info(f"  - {n_large} large files -> parallel process pool ({eff_workers} workers)")
+    else:
+        logger.info(f"  - {n_large} large files -> stream batches ({stream_batch_size} rows)")
     logger.info(f"Merging into {output_file}... (compression={compression})")
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -266,17 +395,22 @@ def generate_parquet(
             if writer is None:
                 writer = pq.ParquetWriter(output_file, table.schema, compression=compression)
 
-        # Phase 1 - large files (streaming, main thread)
+        # Phase 1 - large files (parallel or streaming)
         if large_files:
-            logger.info("Phase 1/2: streaming large files...")
-            with tqdm(total=n_large, desc=f"Streaming {output_file.name}", unit="file") as pbar:
+            logger.info("Phase 1/2: processing large files...")
+            with tqdm(total=n_large, desc=f"Processing {output_file.name}", unit="file") as pbar:
                 for f in large_files:
+                    if stream_workers > 0:
+                        iterable = parallel_read_large_file(f, block_bytes, stream_workers)
+                    else:
+                        iterable = stream_batches(f, stream_batch_size)
+
                     file_size = f.stat().st_size
                     with tqdm(
                         total=file_size, unit="B", unit_scale=True, desc=f.name, leave=False
                     ) as inner_pbar:
                         last_pos = 0
-                        for fname, df, intra, instr, pos in stream_batches(f, stream_batch_size):
+                        for fname, df, intra, instr, pos in iterable:
                             total_duplicates += intra
                             if df.is_empty():
                                 inner_pbar.update(pos - last_pos)

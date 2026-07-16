@@ -6,6 +6,14 @@ from pathlib import Path
 from deribit_fetcher.config import Config
 
 
+@pytest.fixture(autouse=True)
+def _clean_env(monkeypatch):
+    """Ensure a hermetic environment: clear ambient proxy/currency vars so tests
+    don't depend on the host (e.g. a CI runner or shell with HTTP_PROXY set)."""
+    for var in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "CURRENCY"):
+        monkeypatch.delenv(var, raising=False)
+
+
 class TestConfig:
     def test_default_values(self, monkeypatch):
         """Config should have sensible defaults."""

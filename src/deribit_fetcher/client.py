@@ -119,8 +119,17 @@ class DeribitClient:
 
         return instruments
 
-    async def get_last_trade_seq(self, instrument: str) -> int:
-        """Get the latest trade_seq for an instrument. Returns 0 if no trades exist."""
+    async def get_last_trade_seq(self, instrument: str) -> int | None:
+        """Get the latest trade_seq for an instrument.
+
+        Returns:
+            0    — request succeeded and the instrument genuinely has no trades.
+            > 0  — the latest trade_seq.
+            None — could not determine (request still failing after all retries).
+                   Callers MUST treat this as "unknown, retry next run" and must
+                   NOT mark the instrument complete, otherwise a transient failure
+                   would silently drop the instrument's entire history.
+        """
         try:
             params = {"instrument_name": instrument, "count": 1}
             data = await self._fetch("/get_last_trades_by_instrument", params)
@@ -128,7 +137,7 @@ class DeribitClient:
             return trades[0]["trade_seq"] if trades else 0
         except Exception as e:
             logger.error(f"Failed to get last trade seq for {instrument}: {e}")
-            return 0
+            return None
 
     async def get_trades_chunk(
         self, instrument: str, start_seq: int, end_seq: int

@@ -59,11 +59,26 @@ async def _prepare_tasks(
             incompleted_futures, deribit_client
         )
 
-        # Futures with no trades (last_seq == 0) are marked complete immediately
+        # last_seq semantics (see DeribitClient.get_last_trade_seq):
+        #   None -> could not determine this run; leave incomplete and retry next
+        #           run. Do NOT mark complete (that would silently drop its data).
+        #   0    -> genuinely no trades; mark complete now.
+        #   > 0  -> has trades; pre-allocate chunks.
+        undetermined = [f for f in incompleted_futures if f.get("last_seq") is None]
+        if undetermined:
+            logger.warning(
+                f"{len(undetermined)} futures could not resolve last_seq this run "
+                f"(will retry on next run): "
+                f"{', '.join(f['instrument'] for f in undetermined[:5])}"
+                f"{' ...' if len(undetermined) > 5 else ''}"
+            )
+
         no_trade_futures = [f for f in incompleted_futures if f.get("last_seq") == 0]
         for f in no_trade_futures:
             await repo.mark_future_complete(f["instrument"])
-        todo_futures = [f for f in incompleted_futures if f.get("last_seq", 0) > 0]
+        todo_futures = [
+            f for f in incompleted_futures if (f.get("last_seq") or 0) > 0
+        ]
 
         # Pre-allocate chunks: partition [1, last_seq] into fixed-size ranges
         for f in todo_futures:

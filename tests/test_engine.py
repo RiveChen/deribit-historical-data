@@ -154,6 +154,56 @@ class TestGracefulShutdown:
 
         assert attempt_count >= 2, "Task should be retried after error"
 
+    async def test_dead_letter_on_persistent_failure(self, engine):
+        """A task that always fails should end up in dead_letters, not loop forever."""
+        stop_event = asyncio.Event()
+
+        async def always_fail(tasking):
+            raise ValueError("Permanent failure")
+
+        async def noop_sync(buffers):
+            pass
+
+        tasks = [{"id": 1}]
+
+        await engine.run(
+            initial_tasks=tasks,
+            fetch_func=always_fail,
+            sync_db_func=noop_sync,
+            stop_event=stop_event,
+        )
+
+        assert len(engine.dead_letters) == 1, "Failed task should be in dead_letters"
+        assert engine.dead_letters[0]["id"] == 1
+
+    async def test_dead_letter_does_not_block_other_tasks(self, engine):
+        """A permanently failing task should not prevent a healthy task from succeeding."""
+        stop_event = asyncio.Event()
+        success_flag = False
+
+        async def mixed_fetch(tasking):
+            nonlocal success_flag
+            if tasking.get("id") == "fail":
+                raise ValueError("Permanent failure")
+            success_flag = True
+            return {"instrument": "test", "data": []}
+
+        async def noop_sync(buffers):
+            pass
+
+        tasks = [{"id": "fail"}, {"id": "ok"}]
+
+        await engine.run(
+            initial_tasks=tasks,
+            fetch_func=mixed_fetch,
+            sync_db_func=noop_sync,
+            stop_event=stop_event,
+        )
+
+        assert success_flag is True, "Healthy task should complete"
+        assert len(engine.dead_letters) == 1, "Exactly one dead-letter"
+        assert engine.dead_letters[0]["id"] == "fail"
+
     async def test_multiple_instruments_buffered_correctly(self, engine):
         """Consumer should buffer per instrument correctly."""
         stop_event = asyncio.Event()

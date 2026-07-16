@@ -9,6 +9,9 @@ from tqdm.asyncio import tqdm
 
 from deribit_fetcher.config import logger
 
+# Maximum number of times a single task will be retried before being moved to dead-letters.
+MAX_TASK_RETRIES = 3
+
 
 class FetcherEngine:
     """Generic async producer-consumer engine for data fetching workloads.
@@ -31,6 +34,8 @@ class FetcherEngine:
         self.storage_queue = Queue(maxsize=storage_queue_size)
         # Tracks number of completed instruments (used by option streaming)
         self.completed_count: int = 0
+        # Tasks that exceeded the maximum retry count — collected rather than dropped silently.
+        self.dead_letters: list[dict] = []
 
     async def enqueue_task(self, task: dict) -> None:
         """Public method to enqueue a new task during streaming.
@@ -72,9 +77,22 @@ class FetcherEngine:
                 pbar.update(1)
 
             except Exception as e:
-                logger.warning(f"Error executing task {tasking}: {e}. Retrying...")
-                if not stop_event.is_set():
-                    await self.task_queue.put(tasking)
+                attempts = tasking.get("_attempts", 0) + 1
+                tasking["_attempts"] = attempts
+                if attempts >= MAX_TASK_RETRIES:
+                    logger.error(
+                        f"Task failed {attempts} times, moving to dead-letter: "
+                        f"{tasking.get('instrument', tasking.get('id', '?'))}: {e}"
+                    )
+                    self.dead_letters.append(dict(tasking))
+                    # Task is NOT re-queued — permanently discarded
+                else:
+                    logger.warning(
+                        f"Error executing task (attempt {attempts}/{MAX_TASK_RETRIES}): "
+                        f"{tasking}: {e}"
+                    )
+                    if not stop_event.is_set():
+                        await self.task_queue.put(tasking)
 
             finally:
                 self.task_queue.task_done()

@@ -258,3 +258,7 @@ Design & developer docs live in [docs/](./docs/): [overview](./docs/overview.md)
 - **Chunk boundary overlap**: Occasionally Deribit may return 1 overlapping trade at chunk boundaries. This is tolerated — duplicates can be removed during Parquet conversion by `(instrument_name, trade_seq)` dedup.
 - **No-trade instruments**: Some early expired instruments have zero trades and are skipped automatically.
 - **Trade schema**: Future and Option trades share the same fields. The Parquet generator uses a comprehensive 18-field union schema to capture every field seen in real API responses, including rare ones like `liquidation`, `block_trade_id`, `block_rfq_id`, `combo_id`, etc. Missing fields are automatically filled as null.
+
+## Acknowledgments
+
+Portions of the tooling, tests, and documentation were developed with assistance from [Claude](https://www.anthropic.com/claude) (Anthropic).

@@ -228,3 +228,7 @@ _把下表占位符替换为你机器上的实测数字（见 `benchmark_results
 - **块边界重叠**：Deribit 偶尔会在块边界返回 1 条重叠的成交。这可以容忍 — 重复数据可在 Parquet 转换阶段按 `(instrument_name, trade_seq)` 去重。
 - **无成交交易对**：部分早期过期的交易对没有任何成交，自动跳过。
 - **成交结构**：期货和期权的成交共享相同的字段。Parquet 生成器使用完整的 18 字段 union schema 以捕获真实 API 响应中出现的所有字段，包括罕见的 `liquidation`、`block_trade_id`、`block_rfq_id`、`combo_id` 等，缺失字段自动填充为 null。
+
+## 致谢
+
+部分工具代码、测试与文档在 [Claude](https://www.anthropic.com/claude)（Anthropic）的协助下完成。

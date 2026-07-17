@@ -3,7 +3,7 @@
 
 import argparse
 
-from deribit_fetcher.config import settings
+from deribit_fetcher.config import set_base_dir, settings
 from deribit_fetcher.log import setup_logging
 from deribit_fetcher.parquet import validate_parquet
 
@@ -18,9 +18,16 @@ def main() -> None:
         default="both",
         help="Type of data to validate (default: both).",
     )
+    parser.add_argument(
+        "--base-dir",
+        type=str,
+        default=None,
+        help="Override the data directory (default: ./data/<CURRENCY>).",
+    )
 
     args = parser.parse_args()
     setup_logging()
+    set_base_dir(args.base_dir)
 
     types = ["future", "option"] if args.type == "both" else [args.type]
 

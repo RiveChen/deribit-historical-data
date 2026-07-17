@@ -87,6 +87,8 @@ The remaining tuning knobs live in [`src/deribit_fetcher/config.py`](./src/derib
 | `MAX_RPS` | `20` | Requests per second limit |
 | `MAX_WORKERS` | `40` | Max concurrent HTTP connections |
 
+Data is stored under `./data/<CURRENCY>` by default. Pass `--base-dir PATH` to any command (`future`, `option`, `gen_parquet.py`, `validate_data.py`) to relocate it, e.g. `uv run python -m deribit_fetcher.future --base-dir /mnt/disk/deribit`.
+
 ## Usage
 
 You will need ~10 GB for BTC option and ~90 GB for BTC future trades raw data (as of May 2026). Make sure you have enough disk space with the `data/` directory.

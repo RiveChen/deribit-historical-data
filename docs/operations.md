@@ -38,6 +38,16 @@ These are `Config` dataclass fields, **not** environment variables — edit the 
 
 Engine worker counts and queue sizes are module-level constants in `future.py` / `option.py` (`MAX_WORKER_TASKS`, `WRITE_BATCH_SIZE`, `TASK_QUEUE_SIZE`, `STORAGE_QUEUE_SIZE`).
 
+### Data directory (`--base-dir`)
+
+By default all data lives under `./data/<CURRENCY>`. Every command (`future`, `option`, `gen_parquet.py`, `validate_data.py`) accepts `--base-dir PATH` to relocate that root — e.g. onto an external drive. When set, the JSONL directories, `*.db`, and `*.parquet` all live directly under `PATH`.
+
+```bash
+uv run python -m deribit_fetcher.future --base-dir /mnt/disk/deribit
+uv run python scripts/gen_parquet.py --type future --base-dir /mnt/disk/deribit
+uv run python scripts/validate_data.py --base-dir /mnt/disk/deribit
+```
+
 ## Running
 
 ### 1. Fetch trades → JSONL
@@ -69,6 +79,7 @@ Flags:
 | `--stream-batch-size` | `200000` | Rows per streaming batch for large files. |
 | `--stream-workers` | `0` | `>0` reads large files in parallel via a **process pool** (true parallelism); `0` uses single-thread mmap streaming. |
 | `--block-bytes` | `100 MB` | Byte-block size for parallel large-file reading. |
+| `--base-dir` | (none) | Override the data directory (default `./data/<CURRENCY>`). |
 
 JSONL source files are kept; you need room for both JSONL and the (smaller) Parquet.
 

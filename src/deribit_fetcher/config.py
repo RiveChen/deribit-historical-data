@@ -33,11 +33,16 @@ class Config:
     # Network
     PROXY: str | None = None
 
+    # Optional override for the data base directory (set via --base-dir).
+    base_dir_override: Path | None = None
+
     # --- derived path properties ---
 
     @property
     def base_dir(self) -> Path:
-        """Root data directory based on current CURRENCY."""
+        """Root data directory: the --base-dir override if set, else ./data/<CURRENCY>."""
+        if self.base_dir_override is not None:
+            return self.base_dir_override
         return Path("./data") / self.CURRENCY
 
     @property
@@ -76,3 +81,12 @@ class Config:
 logger = logging.getLogger("Deribit Fetcher")
 
 settings = Config.from_env()
+
+
+def set_base_dir(path: str | os.PathLike | None) -> None:
+    """Override the data base directory on the global settings (used by --base-dir).
+
+    A falsy path (None or empty string) leaves the default in place.
+    """
+    if path:
+        settings.base_dir_override = Path(path)

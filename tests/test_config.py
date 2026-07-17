@@ -93,3 +93,34 @@ class TestConfig:
         c = Config.from_env()
         assert c.CURRENCY == "ETH"
         assert c.base_dir == Path("./data/ETH")
+
+
+class TestBaseDirOverride:
+    """Test suite for the --base-dir override on Config."""
+
+    def test_override_replaces_default_base_dir(self):
+        """base_dir_override should replace ./data/<CURRENCY> for all derived paths."""
+        c = Config(base_dir_override=Path("/mnt/deribit"))
+        assert c.base_dir == Path("/mnt/deribit")
+        assert c.data_future_dir == Path("/mnt/deribit/future")
+        assert c.data_option_dir == Path("/mnt/deribit/option")
+        assert c.future_db_path == Path("/mnt/deribit/future.db")
+        assert c.option_db_path == Path("/mnt/deribit/option.db")
+
+    def test_no_override_uses_currency_default(self):
+        """With no override, base_dir still derives from CURRENCY."""
+        c = Config(CURRENCY="ETH")
+        assert c.base_dir == Path("./data/ETH")
+
+    def test_set_base_dir_helper_mutates_settings(self, monkeypatch):
+        """set_base_dir() should override the global settings; falsy input is a no-op."""
+        from deribit_fetcher import config as config_mod
+
+        monkeypatch.setattr(config_mod.settings, "base_dir_override", None)
+
+        config_mod.set_base_dir(None)
+        assert config_mod.settings.base_dir_override is None
+
+        config_mod.set_base_dir("/tmp/deribit-data")
+        assert config_mod.settings.base_dir == Path("/tmp/deribit-data")
+        assert config_mod.settings.future_db_path == Path("/tmp/deribit-data/future.db")

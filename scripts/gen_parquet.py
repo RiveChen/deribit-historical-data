@@ -6,7 +6,7 @@ import logging
 import os
 from pathlib import Path
 
-from deribit_fetcher.config import settings
+from deribit_fetcher.config import set_base_dir, settings
 from deribit_fetcher.log import setup_logging
 from deribit_fetcher.parquet import (
     BATCH_SIZE,
@@ -71,9 +71,16 @@ def main() -> None:
         help=f"Block size in bytes for parallel large-file reading "
         f"(default: {DEFAULT_BLOCK_BYTES}).",
     )
+    parser.add_argument(
+        "--base-dir",
+        type=str,
+        default=None,
+        help="Override the data directory (default: ./data/<CURRENCY>).",
+    )
 
     args = parser.parse_args()
     setup_logging()
+    set_base_dir(args.base_dir)
 
     data_type = args.type
     input_dir: Path

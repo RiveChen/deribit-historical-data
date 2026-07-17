@@ -19,7 +19,7 @@ data/
     └── option.parquet
 ```
 
-All paths derive from `CURRENCY` via the `Config` properties (`base_dir`, `data_future_dir`, `future_db_path`, …).
+All paths derive from `base_dir` via the `Config` properties (`base_dir`, `data_future_dir`, `future_db_path`, …). `base_dir` defaults to `./data/<CURRENCY>` but can be relocated with `--base-dir` on any command (see [operations.md](./operations.md#data-directory---base-dir)).
 
 ## JSONL (raw fetch output)
 

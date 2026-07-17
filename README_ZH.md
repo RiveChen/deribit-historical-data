@@ -62,6 +62,8 @@ CURRENCY=ETH uv run python -m deribit_fetcher.future
 | `MAX_RPS` | `20` | 每秒请求数限制 |
 | `MAX_WORKERS` | `40` | 最大并发 HTTP 连接数 |
 
+数据默认存放在 `./data/<CURRENCY>`。可对任意命令（`future`、`option`、`gen_parquet.py`、`validate_data.py`）传 `--base-dir PATH` 来改变位置，例如 `uv run python -m deribit_fetcher.future --base-dir /mnt/disk/deribit`。
+
 ## 使用方法
 
 ### 1. 下载期货成交

@@ -1,12 +1,13 @@
 """Future data fetcher — fetches historical trade data for futures instruments."""
 
+import argparse
 import asyncio
 from typing import Protocol
 
 from tqdm.asyncio import tqdm
 
 from deribit_fetcher import run_main
-from deribit_fetcher.config import logger, settings
+from deribit_fetcher.config import logger, set_base_dir, settings
 from deribit_fetcher.fetcher import run_fetcher
 from deribit_fetcher.progress import FutureProgressRepo
 
@@ -195,8 +196,22 @@ async def run(stop_event: asyncio.Event):
     )
 
 
+def _parse_args() -> argparse.Namespace:
+    """Parse command-line arguments for the future fetcher."""
+    parser = argparse.ArgumentParser(description="Fetch Deribit historical future trades.")
+    parser.add_argument(
+        "--base-dir",
+        type=str,
+        default=None,
+        help="Override the data directory (default: ./data/<CURRENCY>).",
+    )
+    return parser.parse_args()
+
+
 async def main():
-    """Entry point: sets up signal handlers for graceful shutdown and runs the fetcher."""
+    """Parse CLI args, set up signal handlers for graceful shutdown, and run the fetcher."""
+    args = _parse_args()
+    set_base_dir(args.base_dir)
     await run_main(run)
 
 

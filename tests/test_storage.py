@@ -43,13 +43,9 @@ class TestJSONLinesSink:
         """Flush should append to an existing .jsonl file."""
         sink = JSONLinesSink(tmp_path)
         # First flush
-        await sink.flush(
-            {"BTC-TEST": [{"instrument": "BTC-TEST", "data": [{"trade_seq": 1}]}]}
-        )
+        await sink.flush({"BTC-TEST": [{"instrument": "BTC-TEST", "data": [{"trade_seq": 1}]}]})
         # Second flush
-        await sink.flush(
-            {"BTC-TEST": [{"instrument": "BTC-TEST", "data": [{"trade_seq": 2}]}]}
-        )
+        await sink.flush({"BTC-TEST": [{"instrument": "BTC-TEST", "data": [{"trade_seq": 2}]}]})
 
         file_path = tmp_path / "BTC-TEST.jsonl"
         with open(file_path, "rb") as f:

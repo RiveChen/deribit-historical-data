@@ -1,6 +1,5 @@
 """Tests for progress.py: database finalize/resume logic."""
 
-
 import pytest
 import pytest_asyncio
 
@@ -136,9 +135,7 @@ class TestFutureProgressRepo:
             ("BTC-EXPIRED-1",),
         )
         row = await cur.fetchone()
-        assert (
-            row["is_completed"] == 1
-        ), "Expired future with all chunks done should be completed"
+        assert row["is_completed"] == 1, "Expired future with all chunks done should be completed"
 
     async def test_finalize_future_meta_skips_active(self, future_repo):
         """Active (non-expired) future should NOT be marked completed even if chunks done."""
@@ -180,9 +177,9 @@ class TestFutureProgressRepo:
             ("BTC-EXPIRED-PENDING",),
         )
         row = await cur.fetchone()
-        assert (
-            row["is_completed"] == 0
-        ), "Expired future with pending chunks should not be completed"
+        assert row["is_completed"] == 0, (
+            "Expired future with pending chunks should not be completed"
+        )
 
 
 class TestOptionProgressRepo:

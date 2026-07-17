@@ -1,5 +1,10 @@
 # Deribit 历史数据爬虫
 
+[![CI](https://github.com/RiveChen/deribit-historical-data/actions/workflows/ci.yml/badge.svg)](https://github.com/RiveChen/deribit-historical-data/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 > 异步爬虫，从 [Deribit History API v2](https://docs.deribit.com/#public-get_last_trades_by_instrument) 下载全部历史成交数据，支持**期货（Future）**和**期权（Option）**。
 
 ## 功能特点
@@ -185,7 +190,7 @@ scripts/
 - 重启时自动跳过已完成的块/交易对
 - 期权进度使用 `MAX(last_no, ?)` 保护，防止崩溃恢复时进度回退
 
-有关 API 行为的详细信息（如 `has_more` 语义、块边界重叠等），请参阅 [api-reference.md](api-reference.zh.md)。
+有关 API 行为的详细信息（如 `has_more` 语义、块边界重叠等），请参阅 [docs/api-reference.zh.md](./docs/api-reference.zh.md)。
 
 ## 基准测试（Benchmarks）
 
@@ -211,6 +216,10 @@ _把下表占位符替换为你机器上的实测数字（见 `benchmark_results
 | 关闭去重 | — | — | — | — |
 | lz4 (`--fast`) | — | — | — | — |
 | 大文件, 流式 | — | — | — | — |
+
+## 文档
+
+设计与开发文档在 [docs/](./docs/):[概览](./docs/overview.md)、[架构](./docs/architecture.md)、[设计取舍](./docs/design-decisions.md)、[数据模型](./docs/data-model.md)、[Deribit API 说明](./docs/deribit-api.md)、[运维](./docs/operations.md)、[开发](./docs/development.md)。
 
 ## 数据说明
 

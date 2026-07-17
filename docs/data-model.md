@@ -1,0 +1,106 @@
+# Data Model
+
+This page documents the data at rest: on-disk layout, the trade schema, the Parquet output, and the SQLite checkpoint tables. For the live API contract, see [deribit-api.md](./deribit-api.md).
+
+## On-disk layout
+
+```
+data/
+└── {CURRENCY}/                 # e.g. BTC or ETH (from the CURRENCY env var)
+    ├── future/
+    │   ├── BTC-27MAR26.jsonl       # one JSONL file per instrument
+    │   └── ...
+    ├── option/
+    │   ├── BTC-27MAR26-70000-C.jsonl
+    │   └── ...
+    ├── future.db                   # SQLite checkpoint (futures)
+    ├── option.db                   # SQLite checkpoint (options)
+    ├── future.parquet              # produced by gen_parquet.py
+    └── option.parquet
+```
+
+All paths derive from `CURRENCY` via the `Config` properties (`base_dir`, `data_future_dir`, `future_db_path`, …).
+
+## JSONL (raw fetch output)
+
+- One file per instrument, named `<instrument_name>.jsonl`.
+- One trade per line, newline-delimited JSON (serialized with `orjson`).
+- **Append-only**; a killed process leaves a valid prefix (see [design-decisions.md](./design-decisions.md#3-jsonl-as-an-intermediate-layer-parquet-built-afterward)).
+- May contain a small number of duplicate rows by design (chunk-boundary overlap and crash-recovery re-fetch); these are removed at the Parquet stage.
+
+## Trade schema (18-field union)
+
+Future and option trades share one structure. The Parquet generator writes a fixed **18-field union schema** (`parquet.COMPREHENSIVE_SCHEMA`) so any trade type reads correctly; fields absent for a given type are filled with `null`.
+
+| Field | Parquet type | Presence | Meaning |
+|-------|--------------|----------|---------|
+| `trade_seq` | Int64 | always | Per-instrument monotonic sequence number (paging cursor + dedup key). |
+| `trade_id` | String | always | Global trade ID. |
+| `timestamp` | Int64 | always | Trade time, epoch **milliseconds**. |
+| `tick_direction` | Int64 | always | Price-move indicator (0–3). |
+| `price` | Float64 | always | Trade price. |
+| `mark_price` | Float64 | always | Mark price at fetch time (may be null for very old data). |
+| `iv` | Float64 | options only | Implied volatility. |
+| `instrument_name` | String | always | Instrument (also the JSONL filename); dedup key with `trade_seq`. |
+| `index_price` | Float64 | always | Index price at fetch time. |
+| `direction` | String | always | Taker side, `buy` / `sell`. |
+| `amount` | Float64 | always | Trade amount (contract count). |
+| `contracts` | Float64 | futures & options | Contract count (not applicable to all types). |
+| `block_trade_id` | String | block trades | Block trade ID. |
+| `block_rfq_id` | String | block trades | Block RFQ ID. |
+| `block_trade_leg_count` | Int64 | block trades | Number of legs. |
+| `combo_id` | String | combo/spread | Combo/spread identifier. |
+| `combo_trade_id` | String | combo/spread | Combo trade ID. |
+| `liquidation` | String | perpetual | Liquidation flag. |
+
+> The ~10 "always present" fields form the core; the rest appear only for specific trade types. See the full field-by-field notes in [api-reference.md](./api-reference.md#43-trade-structurefull-field-union).
+
+## Parquet (analysis output)
+
+- A single file per kind: `future.parquet`, `option.parquet`.
+- Schema = the 18-field union above.
+- **Deduplicated** by `(instrument_name, trade_seq)`.
+- Compression: **zstd** by default, or **lz4** with `--fast` (~10–15% larger, lower CPU).
+- Written incrementally with a `pyarrow.parquet.ParquetWriter`; row batches are accumulated and flushed to keep memory bounded.
+- Typically several times smaller than the source JSONL — measure the exact ratio with `scripts/benchmark.py`.
+
+## SQLite checkpoint tables
+
+Created by `DatabaseClient` on first connect, with `PRAGMA journal_mode=WAL` and `PRAGMA synchronous=NORMAL`.
+
+### `future_meta` — per-instrument future state
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `instrument` | TEXT | PRIMARY KEY |
+| `is_expired` | INTEGER | 1 = expired (settled), 0 = active |
+| `is_completed` | INTEGER | 1 = fully fetched (skipped on restart) |
+
+### `future_chunk` — per-chunk progress
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `instrument` | TEXT | part of PRIMARY KEY |
+| `chunk_no` | INTEGER | = chunk `start_seq`; part of PRIMARY KEY |
+| `count` | INTEGER | trades fetched for the chunk (default 0) |
+| `has_more` | INTEGER | API `has_more` for the chunk |
+| `is_done` | INTEGER | 1 once finalized |
+
+A chunk is finalized (`is_done=1`) when `count >= CHUNK_SIZE OR has_more = 0`. An expired future is marked complete once all its chunks are done.
+
+### `option_meta` — per-instrument option state + resume offset
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `instrument` | TEXT | PRIMARY KEY |
+| `last_no` | INTEGER | highest fetched `trade_seq`; resume from `last_no + 1` |
+| `is_expired` | INTEGER | 1 = expired, 0 = active |
+| `is_completed` | INTEGER | 1 = fully fetched |
+
+`last_no` is advanced with `SET last_no = MAX(last_no, ?)` so a crash-recovery re-fetch can never roll progress backward. Options are marked complete only when expired and no more trades remain.
+
+## Data integrity notes
+
+- **Gaps**: `validate_data.py` checks per-instrument `trade_seq` continuity and prints a per-bucket gap histogram. A truly empty instrument won't appear in Parquet at all — it is expected, not a gap.
+- **Duplicates**: expected in JSONL, removed in Parquet. `generate_parquet` reports how many were removed.
+- **Timestamps** are epoch-ms UTC; convert with `datetime.fromtimestamp(ts/1000, tz=timezone.utc)`.

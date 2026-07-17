@@ -1,5 +1,10 @@
 # Deribit Historical Data Fetcher
 
+[![CI](https://github.com/RiveChen/deribit-historical-data/actions/workflows/ci.yml/badge.svg)](https://github.com/RiveChen/deribit-historical-data/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue.svg)](https://www.python.org/)
+[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 > An async scraper for downloading full historical trade data from the [Deribit History API v2](https://docs.deribit.com/#public-get_last_trades_by_instrument) for both **Futures** and **Options**.
 
 *If it helps, stars are appreciated!* ⭐
@@ -215,7 +220,7 @@ scripts/
 - On restart, already-completed chunks/instruments are skipped
 - `MAX(last_no, ?)` guard in option progress prevents regression on crash recovery
 
-For detailed API behavior, see: [api-reference.md](./api-reference.md)
+For detailed API behavior, see: [docs/api-reference.md](./docs/api-reference.md)
 
 ## Benchmarks
 
@@ -241,6 +246,10 @@ _Replace the placeholders below with numbers from your machine (`benchmark_resul
 | dedup off | — | — | — | — |
 | lz4 (`--fast`) | — | — | — | — |
 | large file, streaming | — | — | — | — |
+
+## Documentation
+
+Design & developer docs live in [docs/](./docs/): [overview](./docs/overview.md), [architecture](./docs/architecture.md), [design decisions](./docs/design-decisions.md), [data model](./docs/data-model.md), [Deribit API notes](./docs/deribit-api.md), [operations](./docs/operations.md), and [development](./docs/development.md).
 
 ## Data Notes
 

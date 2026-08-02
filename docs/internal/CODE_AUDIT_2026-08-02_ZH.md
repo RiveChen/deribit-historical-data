@@ -5,7 +5,7 @@
 审计范围：`src/deribit_fetcher/`、`scripts/`、`tests/`、构建配置、CI 与核心文档
 审计方式：静态代码审查、现有测试/质量门禁、最小可复现实验；未连接 Deribit 线上 API，也未使用真实 90 GB 数据集做端到端核验。
 
-> **审计后修复状态（2026-08-02）**：本报告识别的三个 P0 已在提交 `8d97623` 修复。P0-1 让活跃 future 的部分尾块以及任何 `has_more=true` 的响应保持 pending；P0-2 以顺序无关的精确位图替代生产路径中的 `max_seen` 过滤，并让 option 游标/checkpoint 显式取整批最大 `trade_seq`；P0-3 改为失败向上抛出、同目录临时文件写入并原子替换。P1-1/P1-2 已在提交 `ca523cd` 修复：任务队列保持严格有界并为 worker 的单个 follow-up/retry 预留槽位，consumer 失败会被主流程立即监督和传播。P1-3 已在提交 `7e247b3` 修复：validator 以 SQLite checkpoint 为 inventory 和已知边界，输出 `COMPLETE` / `INCOMPLETE` / `UNKNOWN` 并使用不同退出码。P1-4 已在提交 `62bec2c` 修复：`dedup=False` 贯穿全部 reader。P1-5 的代码级内存放大已在提交 `9de8870` 修复：进程/线程池均采用 `2 × workers` 固定窗口，并删除无用的逐文件 `set[int]`。P2 的 dead-letter 与 option checkpoint 假成功路径也已在后续工作树修复。完整回归现为 **130 passed**，总覆盖率 **83%**；真实 BTC-PERPETUAL 10000 条样本在串行与 2 进程路径均完成唯一键集合对账。下文保留修复前的发现、复现和验收依据；90 GB 峰值 RSS 实测及其余 P2 工程门禁尚未处理。
+> **审计后修复状态（2026-08-02）**：本报告识别的三个 P0 已在提交 `8d97623` 修复。P0-1 让活跃 future 的部分尾块以及任何 `has_more=true` 的响应保持 pending；P0-2 以顺序无关的精确位图替代生产路径中的 `max_seen` 过滤，并让 option 游标/checkpoint 显式取整批最大 `trade_seq`；P0-3 改为失败向上抛出、同目录临时文件写入并原子替换。P1-1/P1-2 已在提交 `ca523cd` 修复；P1-3 已在提交 `7e247b3` 修复；P1-4 已在提交 `62bec2c` 修复；P1-5 的代码级内存放大已在提交 `9de8870` 修复。P2 的 dead-letter 与 option checkpoint 假成功路径已在提交 `7619c34` 修复；HTTP 重试分类与 JSON-RPC 错误解析也已在后续工作树修复。完整回归现为 **138 passed**，总覆盖率 **84%**；真实 BTC-PERPETUAL 10000 条样本在串行与 2 进程路径均完成唯一键集合对账。下文保留修复前的发现、复现和验收依据；90 GB 峰值 RSS 实测及其余工程门禁尚未处理。
 
 ## 1. 结论
 
@@ -215,6 +215,8 @@
 6. `docs/internal/TECH_DEBT.md` 仍把已修复事项描述为当前状态，`ROADMAP.md` 的部分“完成”状态也未同步。内部审计文档应标注 archived/superseded，避免误导维护决策。
 
 > **失败传播修复状态：已修复。** `engine.run()` 会先排空可安全持久化的成功结果，再在存在 dead-letter 时抛出带失败任务快照的 `FetchTasksFailedError`；`run_fetcher` 因而不会继续执行 future finalize，CLI 也会非零退出。`OptionProgressRepo.update_option_last_no` 的数据库异常现已记录堆栈并重新抛出。持久失败、健康任务并存和 checkpoint 写失败均有回归测试。
+
+> **HTTP 重试修复状态：已修复。** 仅 `TransportError`、HTTP 408/429 与 5xx 进入 tenacity；400/401/403/404 均验证为首次响应即失败。HTTP 200 中的 JSON-RPC `error` 会转为保留 `code/message/data` 的 `DeribitAPIError`，不会被当成成功结果或瞬时故障重试。
 
 ## 5. 值得保留的设计
 

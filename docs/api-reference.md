@@ -284,7 +284,7 @@ BTC-27MAR26:
 
 ```python
 @retry(
-    retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError)),
+    retry=retry_if_exception(is_retryable_exception),
     wait=DeribitRateLimitWait(fallback_wait=wait_random_exponential(multiplier=1, min=1, max=60)),
     stop=stop_after_attempt(10),
     reraise=True,
@@ -293,10 +293,11 @@ BTC-27MAR26:
 
 | Exception Type | Retry Behavior |
 |----------------|----------------|
-| `TimeoutException` (60s) | Exponential backoff, max wait 60s |
-| `ConnectError` | Exponential backoff, max wait 60s |
+| `TransportError` (timeout/network/protocol) | Exponential backoff, max wait 60s |
 | `HTTPStatusError` (429) | Prefer `Retry-After` Header; fallback to exponential backoff |
-| `HTTPStatusError` (other 4xx/5xx) | Same as above |
+| `HTTPStatusError` (408 or 5xx) | Exponential backoff, max wait 60s |
+| `HTTPStatusError` (other 4xx) | No retry; fail immediately |
+| HTTP 200 JSON-RPC `error` | Raise `DeribitAPIError` with code/message/data; no retry |
 
 ### Deribit-specific Headers
 

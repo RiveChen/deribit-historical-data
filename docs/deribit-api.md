@@ -38,7 +38,7 @@ Deribit sometimes returns one overlapping `trade_seq` at chunk boundaries (e.g. 
 ## Rate limiting & retries
 
 - One request at a time is gated by `AsyncLimiter(MAX_RPS, 1)`.
-- Retries via `tenacity`: up to **10 attempts**, `reraise=True`, on `TimeoutException` / `ConnectError` / `HTTPStatusError`.
+- Retries via `tenacity`: up to **10 attempts**, `reraise=True`, for transport errors, HTTP 408/429, and 5xx. Deterministic 4xx responses fail immediately. HTTP-200 JSON-RPC error objects raise `DeribitAPIError` with their code/message/data preserved and are not retried.
 - Wait strategy `DeribitRateLimitWait`: prefer the `Retry-After` header (on 429) + small buffer, else random exponential backoff (1–60 s).
 - `x-ratelimit-reset` is logged for diagnostics but not used in logic.
 

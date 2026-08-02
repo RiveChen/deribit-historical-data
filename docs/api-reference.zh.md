@@ -284,7 +284,7 @@ BTC-27MAR26:
 
 ```python
 @retry(
-    retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError, httpx.HTTPStatusError)),
+    retry=retry_if_exception(is_retryable_exception),
     wait=DeribitRateLimitWait(fallback_wait=wait_random_exponential(multiplier=1, min=1, max=60)),
     stop=stop_after_attempt(10),
     reraise=True,
@@ -293,10 +293,11 @@ BTC-27MAR26:
 
 | 异常类型 | 重试行为 |
 |---------|---------|
-| `TimeoutException` (60s) | 指数退避重试，最大等待 60s |
-| `ConnectError` | 指数退避重试，最大等待 60s |
+| `TransportError`（超时/网络/协议） | 指数退避重试，最大等待 60s |
 | `HTTPStatusError` (429) | 优先读取 `Retry-After` Header；无 Header 则指数退避 |
-| `HTTPStatusError` (其他 4xx/5xx) | 同上 |
+| `HTTPStatusError`（408 或 5xx） | 指数退避重试，最大等待 60s |
+| `HTTPStatusError`（其他 4xx） | 不重试，立即失败 |
+| HTTP 200 JSON-RPC `error` | 抛出保留 code/message/data 的 `DeribitAPIError`，不重试 |
 
 ### Deribit 专属 Header
 

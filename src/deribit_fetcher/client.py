@@ -7,7 +7,7 @@ from aiolimiter import AsyncLimiter
 from tenacity import (
     RetryCallState,
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_random_exponential,
 )
@@ -40,11 +40,28 @@ class DeribitRateLimitWait:
         return self.fallback_wait(retry_state)
 
 
-RETRY_EXCEPTIONS = (
-    httpx.TimeoutException,
-    httpx.ConnectError,
-    httpx.HTTPStatusError,
-)
+RETRYABLE_HTTP_STATUS = {408, 429}
+
+
+class DeribitAPIError(RuntimeError):
+    """Deribit JSON-RPC error returned inside a successful HTTP response."""
+
+    def __init__(self, code: int | None, message: str, data=None):
+        """Preserve the server error code, message, and optional details."""
+        self.code = code
+        self.message = message
+        self.data = data
+        super().__init__(f"Deribit API error {code}: {message}")
+
+
+def is_retryable_exception(error: BaseException) -> bool:
+    """Retry transport failures, 408/429, and server-side 5xx responses only."""
+    if isinstance(error, httpx.TransportError):
+        return True
+    if isinstance(error, httpx.HTTPStatusError):
+        status_code = error.response.status_code
+        return status_code in RETRYABLE_HTTP_STATUS or 500 <= status_code < 600
+    return False
 
 
 class DeribitClient:
@@ -73,7 +90,7 @@ class DeribitClient:
 
     # Retry decorator: hybrid strategy — prefer server's Retry-After, else exponential backoff
     @retry(
-        retry=retry_if_exception_type(RETRY_EXCEPTIONS),
+        retry=retry_if_exception(is_retryable_exception),
         wait=DeribitRateLimitWait(
             fallback_wait=wait_random_exponential(multiplier=1, min=1, max=60)
         ),
@@ -85,6 +102,10 @@ class DeribitClient:
         ),
     )
     async def _fetch(self, endpoint: str, params: dict):
+        return await self._request_once(endpoint, params)
+
+    async def _request_once(self, endpoint: str, params: dict):
+        """Issue one rate-limited request and validate HTTP and JSON-RPC errors."""
         # Rate-limit gate: acquire token before issuing request
         async with self.limiter:
             response = await self.client.get(endpoint, params=params)
@@ -95,7 +116,15 @@ class DeribitClient:
                 logger.error(f"429 Too Many Requests. Reset at: {limit_reset}")
 
             response.raise_for_status()
-            return response.json()
+            payload = response.json()
+            if "error" in payload:
+                error = payload["error"]
+                raise DeribitAPIError(
+                    code=error.get("code"),
+                    message=error.get("message", "Unknown error"),
+                    data=error.get("data"),
+                )
+            return payload
 
     async def get_instruments(self, currency: str, kind: str) -> list:
         """Fetch all instruments (both expired and active) for a given currency and kind."""

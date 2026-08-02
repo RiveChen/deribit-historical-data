@@ -7,9 +7,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_fixed
+from tenacity import RetryCallState, retry, retry_if_exception, stop_after_attempt, wait_fixed
 
-from deribit_fetcher.client import RETRY_EXCEPTIONS, DeribitClient, DeribitRateLimitWait
+from deribit_fetcher.client import (
+    DeribitAPIError,
+    DeribitClient,
+    DeribitRateLimitWait,
+    is_retryable_exception,
+)
 from deribit_fetcher.config import settings
 
 # =============================================================================
@@ -112,16 +117,13 @@ class _FastRetryClient(DeribitClient):
 
     # Re-apply @retry with fast wait so tests don't sleep for seconds
     @retry(
-        retry=retry_if_exception_type(RETRY_EXCEPTIONS),
+        retry=retry_if_exception(is_retryable_exception),
         wait=wait_fixed(0.001),  # Nearly instant retries
         stop=stop_after_attempt(3),
         reraise=True,
     )
     async def _fetch(self, endpoint: str, params: dict):
-        async with self.limiter:
-            response = await self.client.get(endpoint, params=params)
-            response.raise_for_status()
-            return response.json()
+        return await self._request_once(endpoint, params)
 
 
 class TestFetchRetry:
@@ -162,6 +164,58 @@ class TestFetchRetry:
         client = _FastRetryClient(httpx.MockTransport(handler))
         with pytest.raises(httpx.HTTPStatusError):
             await client._fetch("/test", {})
+
+    @pytest.mark.parametrize("status_code", [400, 401, 403, 404])
+    async def test_deterministic_client_errors_are_not_retried(self, status_code):
+        """Request/auth/not-found errors should fail on the first response."""
+        call_count = 0
+
+        def handler(request):
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(status_code)
+
+        client = _FastRetryClient(httpx.MockTransport(handler))
+        with pytest.raises(httpx.HTTPStatusError):
+            await client._fetch("/test", {})
+
+        assert call_count == 1
+
+    @pytest.mark.parametrize("status_code", [408, 500, 503])
+    async def test_retryable_http_errors_retry_then_succeed(self, status_code):
+        """Timeout/rate-limit/server statuses should retry within the budget."""
+        call_count = 0
+
+        def handler(request):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return httpx.Response(status_code)
+            return httpx.Response(200, json={"result": "ok"})
+
+        client = _FastRetryClient(httpx.MockTransport(handler))
+        assert await client._fetch("/test", {}) == {"result": "ok"}
+        assert call_count == 2
+
+    async def test_json_rpc_error_preserves_code_without_retry(self):
+        """An HTTP-200 Deribit error body is explicit and deterministic."""
+        call_count = 0
+
+        def handler(request):
+            nonlocal call_count
+            call_count += 1
+            return httpx.Response(
+                200,
+                json={"error": {"code": 11050, "message": "bad_request", "data": "detail"}},
+            )
+
+        client = _FastRetryClient(httpx.MockTransport(handler))
+        with pytest.raises(DeribitAPIError) as error:
+            await client._fetch("/test", {})
+
+        assert error.value.code == 11050
+        assert error.value.data == "detail"
+        assert call_count == 1
 
 
 # =============================================================================

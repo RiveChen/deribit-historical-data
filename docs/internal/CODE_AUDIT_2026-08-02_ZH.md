@@ -5,7 +5,7 @@
 审计范围：`src/deribit_fetcher/`、`scripts/`、`tests/`、构建配置、CI 与核心文档
 审计方式：静态代码审查、现有测试/质量门禁、最小可复现实验；未连接 Deribit 线上 API，也未使用真实 90 GB 数据集做端到端核验。
 
-> **审计后修复状态（2026-08-02）**：本报告识别的三个 P0 已在当前工作树修复。P0-1 让活跃 future 的部分尾块以及任何 `has_more=true` 的响应保持 pending；P0-2 以顺序无关的精确位图替代生产路径中的 `max_seen` 过滤，并让 option 游标/checkpoint 显式取整批最大 `trade_seq`；P0-3 改为失败向上抛出、同目录临时文件写入并原子替换。完整回归现为 **114 passed**，总覆盖率 **72%**；真实 BTC-PERPETUAL 10000 条样本在串行与 2 进程路径均完成唯一键集合对账。下文保留修复前的发现、复现和验收依据；P1/P2 尚未处理。
+> **审计后修复状态（2026-08-02）**：本报告识别的三个 P0 已在提交 `8d97623` 修复。P0-1 让活跃 future 的部分尾块以及任何 `has_more=true` 的响应保持 pending；P0-2 以顺序无关的精确位图替代生产路径中的 `max_seen` 过滤，并让 option 游标/checkpoint 显式取整批最大 `trade_seq`；P0-3 改为失败向上抛出、同目录临时文件写入并原子替换。P1-1/P1-2 也已在后续工作树修复：任务队列保持严格有界并为 worker 的单个 follow-up/retry 预留槽位，consumer 失败会被主流程立即监督和传播。完整回归现为 **116 passed**，总覆盖率 **72%**；真实 BTC-PERPETUAL 10000 条样本在串行与 2 进程路径均完成唯一键集合对账。下文保留修复前的发现、复现和验收依据；其余 P1/P2 尚未处理。
 
 ## 1. 结论
 
@@ -156,6 +156,8 @@
 
 ### P1-1：动态任务生成可使有界队列死锁
 
+> **修复状态：已修复。** 初始任务仍最多占 `task_queue_size` 个槽位，物理队列额外预留 `worker_count` 个槽位，供每个正在执行的任务非阻塞地产生一个 follow-up 或 retry。逻辑任务计数覆盖动态任务，因此完成判断不再依赖可能瞬时归零的 `Queue.join()`。`worker_count=2`、`task_queue_size=1`、3 个初始任务及 3 个 follow-up 的确定性回归测试可在 1 秒内完成，队列上界为 3，不使用无限队列。
+
 `engine.py:68-74` 在 worker 内先执行 `on_success`，option 的回调再通过 `engine.py:40-46` 阻塞写回同一个有界 `task_queue`。当队列已满且所有 worker 都在等待写入后续任务时，没有 worker 能继续消费队列，形成循环等待。
 
 最小并发实验使用 `worker_count=2`、`task_queue_size=1`、3 个初始任务和每任务一个 follow-up，能够稳定超时并输出 `deadlocked`。
@@ -163,6 +165,8 @@
 建议将“分页链”放在单个 instrument worker 内循环，或引入独立调度协程，使 producer 不承担可能阻塞的回写；不要简单改成无限队列。验收测试应在上述最小容量配置下于固定超时内完成。
 
 ### P1-2：consumer 失败没有被主任务及时监督
+
+> **修复状态：已修复。** 初始任务投喂与运行完成等待都同时监督 `consumer_task`；首次 flush 抛出 `OSError` 后，主流程会取消 producer、回收后台任务并原样向调用方传播异常。20 个任务、容量均为 1 的压力回归在 1 秒内 fail-fast，不再超时，也不再出现 `Task exception was never retrieved`。
 
 `engine.py:178-207` 创建 consumer 后，主流程只等待 `task_queue.join()` 或停止信号，没有同时等待 `consumer_task`。若 `sync_db_func` 在 `engine.py:122/138/147` 抛异常，consumer 会退出；producer 随后可能填满 `storage_queue`，再也无法完成 `task_queue.task_done()`，主任务永久等待。
 
@@ -251,7 +255,7 @@
 - [ ] 对 BTC future 与 option 各选一组真实数据，比较 JSONL 与 Parquet 的唯一键集合；
 - [ ] 校验能识别缺首段、缺尾段、缺 instrument 和重复掩盖缺口；
 - [ ] 任一读取/写入/checkpoint 错误导致非零退出，旧产物不被覆盖；
-- [ ] 压力测试证明小容量队列不会死锁；
+- [x] 压力测试证明小容量队列不会死锁，consumer 失败会在固定超时内向上冒泡；
 - [ ] CI 强制 test、lint、format，并设置非零覆盖率下限；
 - [ ] README 中所有“全量、无 OOM、去重关闭、Done”语义与可执行证据一致。
 

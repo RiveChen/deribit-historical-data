@@ -30,20 +30,53 @@ class FetcherEngine:
         """Initialize the engine with concurrency and queue settings."""
         self.worker_count = worker_count
         self.write_batch_size = write_batch_size
-        self.task_queue = Queue(maxsize=task_queue_size)
+        # Initial work may occupy at most ``task_queue_size`` slots. One extra
+        # slot per active producer is reserved for its single follow-up/retry,
+        # which breaks circular waits while keeping the queue strictly bounded.
+        self.task_queue = Queue(maxsize=task_queue_size + worker_count)
+        self._initial_task_slots = asyncio.Semaphore(task_queue_size)
         self.storage_queue = Queue(maxsize=storage_queue_size)
+        self._pending_task_count = 0
+        self._all_tasks_done = asyncio.Event()
+        self._all_tasks_done.set()
         # Tracks number of completed instruments (used by option streaming)
         self.completed_count: int = 0
         # Tasks that exceeded the maximum retry count — collected rather than dropped silently.
         self.dead_letters: list[dict] = []
 
+    def _add_pending_task(self) -> None:
+        """Register one new logical task before making it visible to workers."""
+        self._pending_task_count += 1
+        self._all_tasks_done.clear()
+
+    def _finish_pending_task(self) -> None:
+        """Mark one logical task complete, including terminal failures."""
+        if self._pending_task_count <= 0:
+            raise RuntimeError("Pending task count underflow")
+        self._pending_task_count -= 1
+        if self._pending_task_count == 0:
+            self._all_tasks_done.set()
+
     async def enqueue_task(self, task: dict) -> None:
         """Public method to enqueue a new task during streaming.
 
         Used by ``on_success`` callbacks (e.g. option's streaming fetch)
-        to dynamically add follow-up chunks to the task queue.
+        to dynamically add one follow-up chunk. Reserved producer slots make
+        this non-blocking without turning the task queue into an unbounded queue.
         """
-        await self.task_queue.put(task)
+        self._add_pending_task()
+        try:
+            self.task_queue.put_nowait((task, False))
+        except asyncio.QueueFull as error:
+            self._finish_pending_task()
+            raise RuntimeError("A callback scheduled more than one follow-up task") from error
+
+    def _retry_task(self, task: dict) -> None:
+        """Schedule an existing logical task for retry without double-counting it."""
+        try:
+            self.task_queue.put_nowait((task, False))
+        except asyncio.QueueFull as error:
+            raise RuntimeError("Reserved retry slot invariant violated") from error
 
     async def _producer_worker(
         self,
@@ -55,15 +88,20 @@ class FetcherEngine:
         """Pull tasks from the queue, fetch data, and enqueue results for storage."""
         while not stop_event.is_set():
             try:
-                tasking = await asyncio.wait_for(self.task_queue.get(), timeout=1.0)
+                queued_task = await asyncio.wait_for(self.task_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
 
             # None is the poison pill — signals shutdown
-            if tasking is None:
+            if queued_task is None:
                 self.task_queue.task_done()
                 break
 
+            tasking, uses_initial_slot = queued_task
+            if uses_initial_slot:
+                self._initial_task_slots.release()
+
+            logical_task_finished = False
             try:
                 result_item = await fetch_func(tasking)
 
@@ -75,6 +113,7 @@ class FetcherEngine:
 
                 # Default: advance progress bar by one chunk
                 pbar.update(1)
+                logical_task_finished = True
 
             except Exception as e:
                 attempts = tasking.get("_attempts", 0) + 1
@@ -86,15 +125,25 @@ class FetcherEngine:
                     )
                     self.dead_letters.append(dict(tasking))
                     # Task is NOT re-queued — permanently discarded
+                    logical_task_finished = True
                 else:
                     logger.warning(
                         f"Error executing task (attempt {attempts}/{MAX_TASK_RETRIES}): "
                         f"{tasking}: {e}"
                     )
                     if not stop_event.is_set():
-                        await self.task_queue.put(tasking)
+                        try:
+                            self._retry_task(tasking)
+                        except RuntimeError as retry_error:
+                            logger.error(f"Could not schedule task retry: {retry_error}")
+                            self.dead_letters.append(dict(tasking))
+                            logical_task_finished = True
+                    else:
+                        logical_task_finished = True
 
             finally:
+                if logical_task_finished:
+                    self._finish_pending_task()
                 self.task_queue.task_done()
 
     async def _consumer_worker(
@@ -184,43 +233,95 @@ class FetcherEngine:
             for _ in range(self.worker_count)
         ]
 
+        completion_task = None
+        stop_signal_task = asyncio.create_task(stop_event.wait())
+
+        def raise_if_background_stopped(task: asyncio.Task, name: str) -> None:
+            """Propagate a background failure instead of letting queue writes hang."""
+            if not task.done():
+                return
+            if task.cancelled():
+                raise RuntimeError(f"{name} stopped unexpectedly")
+            error = task.exception()
+            if error is not None:
+                raise error
+            raise RuntimeError(f"{name} stopped unexpectedly")
+
         try:
             # Feed initial tasks into the task queue
             for task in initial_tasks:
                 if stop_event.is_set():
                     logger.info("Stop event set during task distribution.")
                     break
-                while not stop_event.is_set():
-                    try:
-                        await asyncio.wait_for(self.task_queue.put(task), timeout=0.5)
-                        break
-                    except asyncio.TimeoutError:
-                        continue
 
-            # Wait for either all tasks to complete, or shutdown signal
-            queue_finished = asyncio.create_task(self.task_queue.join())
-            stop_signal_task = asyncio.create_task(stop_event.wait())
+                self._add_pending_task()
+                enqueued = False
+                slot_task = asyncio.create_task(self._initial_task_slots.acquire())
+                acquired_slot = False
+                try:
+                    done, _ = await asyncio.wait(
+                        [slot_task, stop_signal_task, consumer_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
 
-            await asyncio.wait(
-                [queue_finished, stop_signal_task],
+                    if slot_task in done:
+                        await slot_task
+                        acquired_slot = True
+
+                    if not stop_event.is_set():
+                        raise_if_background_stopped(consumer_task, "Storage consumer")
+                        if acquired_slot:
+                            self.task_queue.put_nowait((task, True))
+                            enqueued = True
+                finally:
+                    if not slot_task.done():
+                        slot_task.cancel()
+                    await asyncio.gather(slot_task, return_exceptions=True)
+                    if acquired_slot and not enqueued:
+                        self._initial_task_slots.release()
+                    if not enqueued:
+                        self._finish_pending_task()
+
+                if stop_event.is_set():
+                    logger.info("Stop event set during task distribution.")
+                    break
+
+            # Wait for logical completion, shutdown, or a supervised worker failure.
+            completion_task = asyncio.create_task(self._all_tasks_done.wait())
+
+            done, _ = await asyncio.wait(
+                [completion_task, stop_signal_task, consumer_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            if stop_event.is_set() and not queue_finished.done():
-                queue_finished.cancel()
+            if not stop_event.is_set():
+                if consumer_task in done:
+                    raise_if_background_stopped(consumer_task, "Storage consumer")
 
         finally:
+            for waiter in (completion_task, stop_signal_task):
+                if waiter is not None:
+                    waiter.cancel()
+            await asyncio.gather(
+                *(waiter for waiter in (completion_task, stop_signal_task) if waiter is not None),
+                return_exceptions=True,
+            )
+
             # Cancel all producer workers
             for w in workers:
                 w.cancel()
             await asyncio.gather(*workers, return_exceptions=True)
 
-            # Send poison pill to consumer and wait for it to drain
             try:
-                await asyncio.wait_for(self.storage_queue.put(None), timeout=2.0)
-                await asyncio.wait_for(consumer_task, timeout=10.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                logger.error("Consumer forced shutdown.")
-
-            pbar.close()
+                # Send poison pill to consumer and wait for it to drain.
+                try:
+                    if not consumer_task.done():
+                        await asyncio.wait_for(self.storage_queue.put(None), timeout=2.0)
+                    await asyncio.wait_for(consumer_task, timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.error("Consumer forced shutdown.")
+                    consumer_task.cancel()
+                    await asyncio.gather(consumer_task, return_exceptions=True)
+            finally:
+                pbar.close()
             logger.info("Engine run completed.")

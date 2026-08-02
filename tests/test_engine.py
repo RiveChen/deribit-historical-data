@@ -238,3 +238,87 @@ class TestGracefulShutdown:
         final_buffers = received_buffers[-1]
         assert "BTC-A" in final_buffers
         assert "BTC-B" in final_buffers
+
+    async def test_dynamic_tasks_do_not_deadlock_when_task_queue_is_full(self):
+        """Follow-up tasks must not block every producer on the bounded task queue."""
+        engine = FetcherEngine(
+            worker_count=2,
+            write_batch_size=1,
+            task_queue_size=1,
+            storage_queue_size=10,
+        )
+        assert engine.task_queue.maxsize == 3
+        stop_event = asyncio.Event()
+        release_fetches = asyncio.Event()
+        both_workers_started = asyncio.Event()
+        started_count = 0
+        fetched = []
+
+        async def fetch_func(tasking):
+            nonlocal started_count
+            if tasking["depth"] == 0 and tasking["id"] < 2:
+                started_count += 1
+                if started_count == 2:
+                    both_workers_started.set()
+                await release_fetches.wait()
+            fetched.append((tasking["id"], tasking["depth"]))
+            return {"instrument": "test", "data": [], "finished": False}
+
+        async def on_success(tasking, result_item):
+            if tasking["depth"] == 0:
+                await engine.enqueue_task({"id": tasking["id"], "depth": 1})
+
+        async def noop_sync(buffers):
+            pass
+
+        runner = asyncio.create_task(
+            engine.run(
+                initial_tasks=[{"id": i, "depth": 0} for i in range(3)],
+                fetch_func=fetch_func,
+                sync_db_func=noop_sync,
+                stop_event=stop_event,
+                on_success=on_success,
+            )
+        )
+
+        await asyncio.wait_for(both_workers_started.wait(), timeout=1.0)
+        while engine.task_queue.qsize() == 0:
+            await asyncio.sleep(0)
+        release_fetches.set()
+
+        await asyncio.wait_for(runner, timeout=1.0)
+        assert sorted(fetched) == [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (2, 0),
+            (2, 1),
+        ]
+
+    async def test_consumer_failure_is_propagated_without_queue_hang(self):
+        """A failed storage consumer must abort producers instead of stalling queues."""
+        engine = FetcherEngine(
+            worker_count=1,
+            write_batch_size=1,
+            task_queue_size=1,
+            storage_queue_size=1,
+        )
+        stop_event = asyncio.Event()
+
+        async def fetch_func(tasking):
+            return {"instrument": "test", "data": [tasking]}
+
+        async def failing_sync(buffers):
+            raise OSError("simulated disk failure")
+
+        with pytest.raises(OSError, match="simulated disk failure"):
+            await asyncio.wait_for(
+                engine.run(
+                    initial_tasks=[{"id": i} for i in range(20)],
+                    fetch_func=fetch_func,
+                    sync_db_func=failing_sync,
+                    stop_event=stop_event,
+                ),
+                timeout=1.0,
+            )

@@ -60,9 +60,10 @@ Deribit history API
 
 The download side is a classic **bounded producer-consumer** pipeline built on `asyncio`:
 
-- **Producers** (`worker_count` coroutines) pull tasks off `task_queue`, call the injected `fetch_func`, run an optional `on_success` callback (options use it to enqueue the next chunk), and push results onto `storage_queue`. On error they re-queue the task.
+- **Producers** (`worker_count` coroutines) pull tasks off `task_queue`, call the injected `fetch_func`, run an optional `on_success` callback (options use it to enqueue one next chunk), and push results onto `storage_queue`. On error they retry the same logical task within a fixed retry budget.
 - **Consumer** (single coroutine) drains `storage_queue`, buffers results per instrument, and flushes to disk+DB when the batch fills or on idle timeout.
-- **Backpressure**: both queues are size-bounded (`task_queue_size`, `storage_queue_size`), so fast producers can't outrun the consumer or exhaust memory.
+- **Backpressure**: both queues are bounded. Initial work occupies at most `task_queue_size` slots; the task queue reserves one additional slot per producer for a follow-up or retry. This keeps a strict `task_queue_size + worker_count` upper bound while preventing producers from deadlocking on the queue they consume.
+- **Failure supervision**: the main coroutine watches the storage consumer during both initial task distribution and steady-state execution. A disk/DB flush error cancels producers and propagates to the caller instead of leaving full queues hanging.
 - **Rate limiting**: `AsyncLimiter(MAX_RPS, 1)` gates every request to ≤ `MAX_RPS` per second, independent of worker count.
 - **Graceful shutdown**: SIGINT/SIGTERM set a `stop_event`; producers stop pulling, the consumer flushes buffered data (poison-pill), and progress already persisted in SQLite makes the next run resumable.
 

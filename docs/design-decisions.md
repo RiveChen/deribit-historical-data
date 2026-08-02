@@ -20,7 +20,7 @@ Short ADR-style records: **context → options → decision → consequences**. 
 - **Future** — fetch `last_seq`, pre-allocate all chunks `[1, last_seq]` up front, feed them as initial tasks (uniform, highly parallel).
 - **Option** — start one task per instrument at `last_no + 1` and let `on_option_success` enqueue the next chunk only when `should_continue`. The task set grows lazily.
 **Why not pre-allocate options too.** Pre-allocating chunks for ~115k mostly-tiny instruments would create huge numbers of empty tasks and bloat the checkpoint DB. Streaming spends work proportional to actual data.
-**Consequences.** Two code paths, but both ride the same engine via injected callbacks. Option progress is a single resumable offset (`last_no`) rather than a chunk table.
+**Consequences.** Two code paths, but both ride the same engine via injected callbacks. Option progress is a single resumable offset (`last_no`) rather than a chunk table. The bounded engine reserves one queue slot per producer for its single follow-up/retry, avoiding circular waits without using an unbounded task queue.
 
 ---
 

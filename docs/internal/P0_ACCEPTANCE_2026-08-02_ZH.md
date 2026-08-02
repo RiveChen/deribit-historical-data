@@ -20,7 +20,7 @@
 | 小文件解析失败 | 通过 | 异常上抛、旧产物保持、临时文件删除 |
 | 多进程 block 解析失败 | 通过 | 子进程异常上抛、旧产物保持、临时文件删除 |
 | 缺失/空输入目录 | 通过 | CLI 非零退出，不再打印假成功 |
-| 完整自动化测试 | 通过 | 114 passed（最终门禁结果见本记录末尾） |
+| 完整自动化测试 | 通过 | 138 passed（最终门禁结果见本记录末尾） |
 | 包构建 | 通过 | sdist 与 wheel 成功，生成物已清理 |
 
 ## 1. 线上 API 契约探针
@@ -131,9 +131,10 @@ key sets equal        = true
 最终交付前执行：
 
 ```text
-pytest -q                 114 passed
+pytest -q                 138 passed, coverage 83.54% (floor 80%)
 ruff check .              passed
 ruff format --check .     passed
+pyrefly check             0 errors
 git diff --check          passed
 uv build --offline        passed
 ```
@@ -145,6 +146,6 @@ uv build --offline        passed
 - [ ] 完整下载一个有多页成交的已过期 option；
 - [ ] BTC 与 ETH 各至少完成一个真实 instrument；
 - [ ] 在接近目标数据规模的输入上记录峰值 RSS、吞吐和临时磁盘占用；
-- [ ] 处理审计报告中的 P1：动态队列死锁、consumer 失败监督、并行内存增长、校验盲区。
+- [x] 处理审计报告中的 P1：动态队列死锁、consumer 失败监督、并行内存增长、校验盲区（代码级回归已通过；真实规模 RSS 单列在上一项）。
 
 在以上清单完成前，可以确认“三个已知 P0 路径已修复”，但仍不应宣称整个数据集已经获得生产级全量认证。

@@ -58,7 +58,7 @@ uv run python -m deribit_fetcher.option     # options
 CURRENCY=ETH uv run python -m deribit_fetcher.future
 ```
 
-Rough cost (BTC, as of 2026): options ≈ 1 h and ~10 GB; futures ≈ 4 h and ~90 GB. Both are **resumable** — re-run after an interruption and it continues from the SQLite checkpoint. `Ctrl-C` (SIGINT) triggers a graceful shutdown that flushes buffered data first.
+The original README estimated about 1 h / 10 GB for BTC options and 4 h / 90 GB for BTC futures in May 2026. Those figures are unverified planning inputs, not current guarantees. Both fetchers are **resumable** — re-run after an interruption and they continue from the SQLite checkpoint. `Ctrl-C` (SIGINT) triggers a graceful shutdown that flushes buffered data first.
 
 ### 2. Merge JSONL → Parquet
 
@@ -74,7 +74,7 @@ Flags:
 | `--type` | (required) | `future` or `option`. |
 | `--no-dedup` | off | Skip `(instrument_name, trade_seq)` dedup. |
 | `--workers` | CPU count | Thread-pool workers for the small-file phase. |
-| `--fast` | off | lz4 instead of zstd (~20% less CPU, ~10–15% larger). |
+| `--fast` | off | lz4 instead of zstd; benchmark the trade-off on the target data. |
 | `--large-threshold-mb` | `100` | Files at/above this size use the streaming/parallel path. |
 | `--stream-batch-size` | `200000` | Rows per streaming batch for large files. |
 | `--stream-workers` | `0` | `>0` reads large files in parallel via a **process pool** (true parallelism); `0` uses single-thread mmap streaming. |
@@ -92,7 +92,7 @@ uv run python scripts/validate_data.py --type future   # future | option | both
 
 Validation uses the matching SQLite checkpoint as its instrument inventory and sequence target. Exit code `0` means every instrument is proven `COMPLETE`; `1` means a known defect (`INCOMPLETE`); `2` means at least one final upper bound is unavailable (`UNKNOWN`). Active instruments commonly produce `UNKNOWN`, which is intentionally distinct from success.
 
-Prints per-instrument row counts, `trade_seq` ranges, a gap flag, and — for instruments with gaps — a bucketed gap histogram. Streaming aggregations keep memory bounded even on a 90 GB Parquet.
+Prints per-instrument row counts, `trade_seq` ranges, a gap flag, and — for instruments with gaps — a bucketed gap histogram. Aggregations are implemented as streaming batches; measure peak RSS on the target dataset before relying on a production memory budget.
 
 ### 4. Benchmark (optional)
 

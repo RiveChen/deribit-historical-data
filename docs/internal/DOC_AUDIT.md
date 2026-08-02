@@ -1,5 +1,7 @@
 # README ↔ Code Reconciliation
 
+> **Historical snapshot.** This file records the published `main` state inspected on 2026-07-04. Later commits implemented some previously missing paths and reconciled the current README; do not treat the findings below as current without re-running them.
+
 _Checked the published `main` README against the published `main` code (fetched from GitHub raw), 2026-07-04._
 
 **Headline:** the README documents a `gen_parquet` that uses a **process pool with `--stream-workers` / `--block-bytes`**, but the actual code uses a **single-threaded mmap streamer** with completely different flags. Anyone who runs the README's commands verbatim gets an `argparse` error. Several env vars in the Configuration table are also silently ignored by the code. These are exactly the mismatches an interviewer catches by opening one file.

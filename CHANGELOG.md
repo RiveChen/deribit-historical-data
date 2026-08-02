@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- Reconciled the README and operations guide with tested behavior: completeness now requires checkpoint-aware validation; historic time/disk figures are labeled as unverified estimates; Parquet flags cover both large-file reader paths; unmeasured performance and memory guarantees were removed.
+- CI now enforces Ruff lint/format, Pyrefly, and an 80% coverage floor; Ruff is a development-only dependency.
+
+### Fixed
+
+- Correctness, supervision, validation, retry, and bounded-reader defects identified by the 2026-08-02 audit. See `docs/internal/CODE_AUDIT_2026-08-02_ZH.md` for the commit-level evidence and remaining full-dataset acceptance gaps.
 
 ## [0.1.0] - 2026-07-17
 
@@ -15,7 +22,7 @@ Initial public release.
 
 ### Added
 
-- Full historical trade download for Deribit **futures** and **options** (BTC/ETH) via `trade_seq`-based chunking.
+- Historical trade download for Deribit **futures** and **options** (BTC/ETH) via `trade_seq`-based chunking.
 - Async producer-consumer engine with per-second rate limiting and bounded-queue backpressure.
 - Resumable runs via a SQLite checkpoint database; graceful `SIGINT`/`SIGTERM` shutdown.
 - JSONL output (one file per instrument) and a `gen_parquet.py` merge step with `(instrument_name, trade_seq)` deduplication.

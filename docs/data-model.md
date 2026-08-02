@@ -60,9 +60,9 @@ Future and option trades share one structure. The Parquet generator writes a fix
 - A single file per kind: `future.parquet`, `option.parquet`.
 - Schema = the 18-field union above.
 - **Deduplicated** by `(instrument_name, trade_seq)`.
-- Compression: **zstd** by default, or **lz4** with `--fast` (~10–15% larger, lower CPU).
+- Compression: **zstd** by default, or **lz4** with `--fast`; benchmark the speed/size trade-off on the target data.
 - Written incrementally with a `pyarrow.parquet.ParquetWriter`; row batches are accumulated and flushed to keep memory bounded.
-- Typically several times smaller than the source JSONL — measure the exact ratio with `scripts/benchmark.py`.
+- Compression ratio depends on the input and codec — measure it with `scripts/benchmark.py`.
 
 ## SQLite checkpoint tables
 

@@ -5,7 +5,9 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-> An async scraper for downloading full historical trade data from the [Deribit History API v2](https://docs.deribit.com/#public-get_last_trades_by_instrument) for both **Futures** and **Options**.
+> A resumable async downloader for historical **Futures** and **Options** trades from the [Deribit History API v2](https://docs.deribit.com/#public-get_last_trades_by_instrument).
+
+> **Verification status:** correctness regressions and a 10000-row BTC-PERPETUAL sample pass; complete future/option datasets and 90 GB peak RSS are not yet certified. Use checkpoint-aware validation before treating an export as complete.
 
 *If it helps, stars are appreciated!* ⭐
 
@@ -18,14 +20,11 @@ cd deribit-historical-data
 # install `uv` if you haven't already, then
 uv sync
 
-# for all BTC option trades data:
+# download available BTC option trade history:
 uv run python -m deribit_fetcher.option
-# note: it may take 1-2 hours and ~10GB disk space for BTC options
 
-# for all BTC future trades data:
+# download available BTC future trade history:
 uv run python -m deribit_fetcher.future
-# note: it may take 3-4 hours and ~90GB disk space for BTC futures 
-
 
 # if you want to merge the downloaded JSONL to a single parquet file:
 uv run python scripts/gen_parquet.py --type option
@@ -34,10 +33,10 @@ uv run python scripts/gen_parquet.py --type future
 
 ## Features
 
-- **Full history download** — fetches every single trade, not just recent ones, using `trade_seq`-based chunking
-- **Async & fast** — up to 20 RPS (the API's limit) via `asyncio`, with a bounded producer-consumer engine and per-second rate limiting
+- **Checkpointed range download** — uses `trade_seq`-based chunking and final checkpoints so completeness can be checked explicitly
+- **Bounded async fetch engine** — uses `asyncio`, bounded queues, and a configurable rate cap (20 RPS by default)
 - **Resumable** — SQLite checkpoint database tracks progress, so partial downloads can be resumed
-- **Graceful shutdown** — handles `SIGINT`/`SIGTERM` cleanly, preserving all data collected so far
+- **Signal-aware shutdown** — handles `SIGINT`/`SIGTERM` and flushes safely persisted batches before returning
 - **JSONL output** — raw data saved as newline-delimited JSON, one trade per line
 - **Parquet export** — utility script to merge all JSONL files into a single compressed Parquet file (with dedup)
 - **Data validation** — streaming Parquet validation (per-instrument `trade_seq` gap detection with a gap-distribution histogram, plus schema & time-range summary) without loading the full file into memory
@@ -83,7 +82,7 @@ The remaining tuning knobs live in [`src/deribit_fetcher/config.py`](./src/derib
 
 | Setting | Default | Description |
 | ---------- | --------- | ------------- |
-| `CHUNK_SIZE` | `10000` | Trades per API request (Deribit max is 10000) |
+| `CHUNK_SIZE` | `10000` | Trades requested per sequence range; confirm the history host's current limit before a long run |
 | `MAX_RPS` | `20` | Requests per second limit |
 | `MAX_WORKERS` | `40` | Max concurrent HTTP connections |
 
@@ -91,14 +90,12 @@ Data is stored under `./data/<CURRENCY>` by default. Pass `--base-dir PATH` to a
 
 ## Usage
 
-You will need ~10 GB for BTC option and ~90 GB for BTC future trades raw data (as of May 2026). Make sure you have enough disk space with the `data/` directory.
-
-It will take about 1 hour to fetch BTC option trades and about 4 hours to fetch all BTC future trades, please be patient.
+Capacity and duration depend on the currency, instruments, network, and the API's current dataset. The original README estimated roughly 10 GB for BTC options and 90 GB for BTC futures in May 2026; treat these only as planning inputs, not measured current results. Run on a volume with headroom and validate the resulting Parquet against its checkpoint database.
 
 ### 1. Fetch Future Trades
 
 ```bash
-# Fetch all BTC futures (default)
+# Fetch available BTC futures history (default)
 uv run python -m deribit_fetcher.future
 
 # Fetch ETH futures with custom settings
@@ -113,7 +110,7 @@ uv run python -m deribit_fetcher.option
 
 ### 3. Export to Parquet
 
-The Parquet generator merges all JSONL files into a single compressed Parquet file with dedup support. The JSONL source files are kept and only a new `.parquet` file is created, so you need free space for the raw JSONL plus the (much smaller) Parquet output. Parquet + zstd is typically several times smaller than the source JSONL — run [`scripts/benchmark.py`](#benchmarks) to measure the exact ratio on your data.
+The Parquet generator merges all JSONL files into a single compressed Parquet file with optional deduplication. The JSONL source files are kept and only a new `.parquet` file is created, so you need free space for both raw input and Parquet output. Run [`scripts/benchmark.py`](#benchmarks) to measure the compression ratio and peak RSS on your data.
 
 ```bash
 # Merge all BTC future JSONL files into a single Parquet
@@ -122,10 +119,10 @@ uv run python scripts/gen_parquet.py --type future
 # Merge all BTC option JSONL files
 uv run python scripts/gen_parquet.py --type option
 
-# Use lz4 compression (faster, ~10-15% larger file)
+# Use lz4 compression (measure the speed/size trade-off on your data)
 uv run python scripts/gen_parquet.py --type future --fast
 
-# Skip deduplication (faster, but may contain duplicate rows)
+# Skip deduplication and preserve duplicate input rows
 uv run python scripts/gen_parquet.py --type future --no-dedup
 
 # Tune the small-file thread pool (default: all CPU cores)
@@ -134,8 +131,10 @@ uv run python scripts/gen_parquet.py --type future --workers 8
 
 The generator uses a two-phase strategy:
 
-- **Small files** (`< --large-threshold-mb`, default 100 MB; typical options): read in parallel with a thread pool (`--workers`), one file per worker, deduped per file.
-- **Large files** (`>= --large-threshold-mb`; typical perpetuals): stream-read in the main thread in fixed-size batches (`--stream-batch-size` rows, default 200000) using `mmap` for zero-copy line splitting. Cross-batch dedup uses an exact per-instrument bitmap (one bit per sequence position), so descending API responses and concurrently appended out-of-order chunks are handled correctly without a Python object per trade.
+- **Small files** (`< --large-threshold-mb`, default 100 MB; typical options): read through a bounded thread-pool window (`--workers`), with deduplication applied only when enabled.
+- **Large files** (`>= --large-threshold-mb`; typical perpetuals): default to single-process `mmap` streaming in fixed-size batches. Set `--stream-workers` to use a bounded process-pool block reader. Cross-batch dedup uses an exact per-instrument bitmap, so descending API responses and concurrently appended out-of-order chunks are handled without a Python object per trade.
+
+Both paths bound outstanding reader results, but peak RSS still depends on batch/block size, worker count, schema, and sequence range. Measure the target dataset before choosing production settings.
 
 All flags:
 
@@ -143,10 +142,12 @@ All flags:
 | ---- | ------- | ----------- |
 | `--type` | (required) | `future` or `option` |
 | `--workers` | CPU count | Thread-pool workers for the small-file phase |
-| `--fast` | off | Use lz4 instead of zstd (faster, ~10-15% larger) |
+| `--fast` | off | Use lz4 instead of zstd |
 | `--no-dedup` | off | Skip `(instrument_name, trade_seq)` dedup |
 | `--large-threshold-mb` | `100` | Files at or above this size use the streaming path |
 | `--stream-batch-size` | `200000` | Rows per streaming batch for large files |
+| `--stream-workers` | `0` | Process workers for large-file block reads; `0` selects single-process streaming |
+| `--block-bytes` | `104857600` | Approximate block size for parallel large-file reads |
 
 ### 4. Validate Data
 

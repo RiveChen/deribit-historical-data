@@ -32,7 +32,7 @@ def main() -> None:
     parser.add_argument(
         "--no-dedup",
         action="store_true",
-        help="Skip deduplication (faster, but may contain duplicate rows).",
+        help="Skip deduplication and preserve duplicate input rows.",
     )
     parser.add_argument(
         "--workers",
@@ -43,13 +43,13 @@ def main() -> None:
     parser.add_argument(
         "--fast",
         action="store_true",
-        help="Trade ~10-15%% larger Parquet for ~20%% lower CPU (lz4 instead of zstd).",
+        help="Use lz4 instead of zstd; benchmark the speed/size trade-off on your data.",
     )
     parser.add_argument(
         "--large-threshold-mb",
         type=float,
         default=100.0,
-        help="Files larger than this (MB) are streamed to avoid OOM (default: 100).",
+        help="Files larger than this (MB) use the bounded-batch reader (default: 100).",
     )
     parser.add_argument(
         "--stream-batch-size",

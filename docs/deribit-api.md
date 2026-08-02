@@ -25,7 +25,7 @@ Developer-facing summary of the Deribit **history** API as this project uses it.
 
 ### 1. `has_more` means "more **within the requested range**"
 
-Not "more data beyond `start_seq`". With a range `[start_seq, end_seq]` of exactly `CHUNK_SIZE` and `count = CHUNK_SIZE`, `has_more` is normally `false` even though older data exists outside the range. A future chunk is final only when `has_more = 0` and either the response fills the fixed range or the instrument has expired. A full-sized response with `has_more = 1` remains pending because the server explicitly reports more rows in the range. An active future's partial tail also remains pending and is safely re-fetched as it grows.
+Not "more data beyond `start_seq`". The history host usually treats it as a count-limit signal within `[start_seq, end_seq]`, but real full-sized responses can leak rows across the boundary and still return `has_more=true`. Future correctness therefore comes from exact in-range `trade_seq` coverage: out-of-range rows are filtered and incomplete ranges are split and re-fetched under a bounded request budget. Active future tails remain pending and are safely re-fetched as they grow.
 
 ### 2. Trades come back **descending**; `trade_seq` is monotonic
 

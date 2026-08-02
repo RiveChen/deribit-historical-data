@@ -44,6 +44,11 @@ MAX_WORKER_TASKS = 15
 WRITE_BATCH_SIZE = 1
 STORAGE_QUEUE_SIZE = 50
 TASK_QUEUE_SIZE = 200
+MAX_RANGE_RECOVERY_REQUESTS = 32
+
+
+class IncompleteTradeRangeError(RuntimeError):
+    """A future sequence range could not be recovered completely."""
 
 
 # ---------------------------------------------------------------------------
@@ -51,13 +56,73 @@ TASK_QUEUE_SIZE = 200
 # ---------------------------------------------------------------------------
 
 
+async def _fetch_complete_range(
+    client: _FetchClientProtocol,
+    instrument: str,
+    start_seq: int,
+    end_seq: int,
+    request_count: list[int],
+) -> list[dict]:
+    """Fetch an exact sequence range, splitting responses that omit in-range rows."""
+    request_count[0] += 1
+    if request_count[0] > MAX_RANGE_RECOVERY_REQUESTS:
+        raise IncompleteTradeRangeError(
+            f"Recovery request budget exceeded for {instrument} [{start_seq}, {end_seq}]"
+        )
+
+    trades, has_more = await client.get_trades_chunk(instrument, start_seq, end_seq)
+    in_range = [row for row in trades if start_seq <= int(row["trade_seq"]) <= end_seq]
+    seen = {int(row["trade_seq"]) for row in in_range}
+    expected_count = end_seq - start_seq + 1
+
+    if len(seen) == expected_count:
+        if has_more:
+            logger.warning(
+                f"{instrument} [{start_seq}, {end_seq}] reported has_more=true "
+                "but every requested sequence was present; accepting exact coverage."
+            )
+        return in_range
+
+    if not in_range or start_seq == end_seq:
+        raise IncompleteTradeRangeError(
+            f"Incomplete response for {instrument} [{start_seq}, {end_seq}]: "
+            f"covered {len(seen)}/{expected_count} unique sequences, has_more={has_more}"
+        )
+
+    midpoint = (start_seq + end_seq) // 2
+    logger.warning(
+        f"Incomplete response for {instrument} [{start_seq}, {end_seq}] "
+        f"({len(seen)}/{expected_count}, has_more={has_more}); splitting at {midpoint}."
+    )
+    left = await _fetch_complete_range(
+        client,
+        instrument,
+        start_seq,
+        midpoint,
+        request_count,
+    )
+    right = await _fetch_complete_range(
+        client,
+        instrument,
+        midpoint + 1,
+        end_seq,
+        request_count,
+    )
+    return left + right
+
+
 async def fetch_future_chunk(tasking: dict, *, client: _FetchClientProtocol) -> dict:
     """Fetch a single chunk of future trades and return it with metadata."""
     instrument = tasking["instrument"]
     start_seq = tasking["chunk_no"]
-    end_seq = start_seq + settings.CHUNK_SIZE - 1
+    end_seq = tasking.get("end_seq")
 
-    trades, has_more = await client.get_trades_chunk(instrument, start_seq, end_seq)
+    if end_seq is None:
+        end_seq = start_seq + settings.CHUNK_SIZE - 1
+        trades, has_more = await client.get_trades_chunk(instrument, start_seq, end_seq)
+    else:
+        trades = await _fetch_complete_range(client, instrument, start_seq, end_seq, [0])
+        has_more = False
     return {
         "instrument": instrument,
         "chunk_no": start_seq,
@@ -163,8 +228,30 @@ async def prepare_future_tasks(
             await repo.upsert_chunks(chunks)
 
     pending_chunks = await repo.get_pending_chunks()
+    if refresh_chunks:
+        last_seq_by_instrument = {
+            f["instrument"]: int(f["last_seq"])
+            for f in incompleted_futures
+            if (f.get("last_seq") or 0) > 0
+        }
+        bounded_chunks = []
+        for chunk in pending_chunks:
+            last_seq = last_seq_by_instrument.get(chunk["instrument"])
+            if last_seq is None or last_seq < chunk["chunk_no"]:
+                logger.warning(
+                    f"Skipping {chunk['instrument']} chunk {chunk['chunk_no']} because "
+                    "a trustworthy end_seq is unavailable; it remains pending."
+                )
+                continue
+            chunk["end_seq"] = min(
+                chunk["chunk_no"] + settings.CHUNK_SIZE - 1,
+                last_seq,
+            )
+            bounded_chunks.append(chunk)
+        pending_chunks = bounded_chunks
+
     if not pending_chunks:
-        logger.info("All chunks are completed.")
+        logger.info("No bounded pending chunks are ready this run.")
         return []
     logger.info(f"Found {len(pending_chunks)} pending chunks.")
     return pending_chunks

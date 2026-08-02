@@ -127,8 +127,8 @@ params = {
 ### `count` 参数
 
 - **history host 实测范围**：1 ~ 10,000（2026-08-02 接受 `count=10,000`）
-- **当 count < 范围内实际数据量**：返回 count 条，`has_more = true`
-- **当 count >= 范围内实际数据量**：返回全部，`has_more = false`
+- **预期语义**：`has_more` 表示请求范围内的结果是否受 count 限制
+- **实测例外**：宽度为 10,000 的 future 区间可能返回 10,000 个跨边界偏移的唯一行并带 `has_more=true`；应以范围内精确键集合为准
 - **注意**：当前 Deribit 通用 API 文档写明上限为 1,000，但 `history.deribit.com` 在 2026-08-02 production 探针中接受并返回了 10,000 行。应把它视为 history host 的兼容性契约并持续监控漂移。
 
 ### `start_seq` 和 `end_seq` 参数
@@ -229,7 +229,7 @@ params = {
 
 ### 5.1 `has_more` 的真正含义
 
-**`has_more` = "本次请求的 [start_seq, end_seq] 范围内，还有更多成交因为 count 限制没有返回"**
+**`has_more` 的预期语义是 count 限制是否遗漏 `[start_seq, end_seq]` 内的数据，但它本身不能证明完整性。**
 
 ⚠️ 它 **不** 表示 "start_seq 之外还有更多数据要抓取"。
 
@@ -246,7 +246,7 @@ params = {
 
 **对代码的影响**：
 
-- **Future.py**：使用 `start_seq` ~ `end_seq` 预分配所有 chunk。因为 CHUNK_SIZE == count 且范围精确 = CHUNK_SIZE，正常情况下 `has_more` 应为 false。只要每个 chunk 的 seq 区间不重叠（`[1,10000], [10001,20000]`...），不会漏数据。✅
+- **Future.py**：任务携带精确结束边界，过滤越界行并将唯一序号集合与完整区间对账。不完整响应在 32 次请求预算内拆分重取，只有精确覆盖才写入完成状态。✅
 - **Option.py**：使用 `next_seq = max(trade_seq) + 1` 流式推进，不依赖响应顺序。满响应或 `has_more=true` 时继续调度。✅
 
 ### 5.2 `trade_seq` 的排序机制
@@ -259,21 +259,21 @@ params = {
 
 #### 实测结果
 
-```
-BTC-27MAR26:
-  Chunk [1,10000]:  seqs [1..10000],  has_more=True
-  Chunk [10001,20000]: seqs [10001..20000], has_more=True
-  → Overlap: 1 个 trade_seq 重复
+```text
+BTC-10SEP21 请求 [30001,40000]：
+  返回唯一范围 [30003,40003]，has_more=true
+  缺失请求键：30001, 30002, 30004
+  泄漏后续键：40001, 40002, 40003
 ```
 
-- **绝大部分 chunks 是严格 disjoint 的**（如 `BTC-30JAN26` 和 `BTC-27FEB26` 的 chunks）
-- **偶有 1 个 trade_seq 的边界重叠**，这是 Deribit 服务端的微小偏差
-- **容忍策略**：JSONL 允许少量重复行，在 Parquet 导出阶段按 `(instrument_name, trade_seq)` 去重
+- 即使返回 10,000 个唯一行，响应也不一定遵守请求的闭区间。
+- **恢复策略**：过滤越界行、拆分不完整区间，并在推进 checkpoint 前要求精确序号集合。
+- **重复策略**：可重启的安全重取可能向 JSONL 追加重复；Parquet 按 `(instrument_name, trade_seq)` 删除。
 
 ### 5.4 `count` 参数与分页
 
 - `count` 参数是 **per-request 的返回条数上限**，不是总条数
-- 当 `count` 设为 CHUNK_SIZE，且 `end_seq - start_seq + 1` 也等于 CHUNK_SIZE 时，`has_more` 由范围内实际数据量决定
+- 即使区间宽度等于 CHUNK_SIZE，响应仍可能跨边界偏移；行数和 `has_more` 都不能证明覆盖完整
 - **当范围内实际数据 < count**：返回当前全部数据，`has_more=false`。只有已过期 instrument 的该 chunk 才能 finalize；活跃 future 的尾块仍可能在后续增长，因此保持 pending。
 
 ---
@@ -397,23 +397,22 @@ WHERE instrument = ?
 | 2 | trade_seq 单调递增，新 > 旧 | ✅ 确认 |
 | 3 | 默认响应严格降序（high seq first） | ❌ 已推翻；实测存在局部逆序 |
 | 4 | Future 和 Option 的 Trade 结构一致 | ✅ 确认（10/10 字段） |
-| 5 | `has_more` 表示范围内是否还有数据 | ✅ 确认，与 count 限制相关 |
-| 6 | count=CHUNK_SIZE 且范围精确时 has_more=false | 通常成立；否则保持 pending |
+| 5 | 仅凭 `has_more` 能证明范围完整 | ❌ 已推翻；必须检查范围内精确键集合 |
+| 6 | count=CHUNK_SIZE 且范围精确时 has_more=false | ❌ 已被偏移的 future 满响应推翻 |
 | 7 | `next_seq = max(trade_seq) + 1` 可继续抓取 | ✅ 确认 |
 | 8 | 已过期的最后 chunk 满足 `count<CHUNK_SIZE AND has_more=0` → 可 finalize | ✅ 确认 |
 | 9 | `start_seq=1` 开始能覆盖全量历史 | ✅ 确认 |
-| 10 | Chunk 边界基本 disjoint（偶有 1 条重叠） | ✅ 确认 |
+| 10 | 响应始终位于请求的 chunk 边界内 | ❌ 已推翻；实测存在边界泄漏 |
 
 ---
 
 ## 9. 已知问题与注意点
 
-### 9.1 Chunk 边界 1-trade 重叠
+### 9.1 Chunk 边界泄漏
 
-- 实测 BTC-27MAR26 的 [1,10000] 和 [10001,20000] 之间有 1 个 `trade_seq` 的重叠
-- 可能是 Deribit 服务端实现中游标偏移量问题
-- **影响**：JSONL 中会出现重复行，Parquet 导出时按 `(instrument_name, trade_seq)` 去重即可
-- **严重程度**：低（数据正确性不受影响，只是轻微冗余）
+- `BTC-10SEP21` 的 `[30001,40000]` 实测返回 10,000 个唯一行，但范围为 `30003..40003`：缺少三个请求键、泄漏三个后续键，并带 `has_more=true`。
+- **处理方式**：过滤到请求范围，拆分不完整区间，并在推进 checkpoint 前核对完整唯一序号集合。
+- **重启行为**：历史 pending chunk 可由自适应路径重取；JSONL 中的重复由 Parquet 导出精确删除。
 
 ### 9.2 无成交的 Instrument
 
@@ -424,9 +423,9 @@ WHERE instrument = ?
 
 ### 9.3 count 参数限制
 
-- 文档上限 10,000，实测也如此
-- 如果 count 设为 10,000 + range 也是 10,000，has_more 似乎始终为 false（即使后面还有数据）
-- **但代码逻辑不依赖此行为**：future 用 seq 范围精确分割，option 用 next_seq 推进
+- 通用 API 文档给出的上限更低，但 history host 在 2026-08-02 探针中接受了 10,000。
+- 宽度 10,000 的区间不能保证 `has_more=false`，也不能保证响应边界准确。
+- **代码不信任该行为**：future 验证精确区间覆盖，option 从返回批次的最大序号推进。
 
 ### 9.4 代理支持
 

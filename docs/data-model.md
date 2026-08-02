@@ -83,10 +83,10 @@ Created by `DatabaseClient` on first connect, with `PRAGMA journal_mode=WAL` and
 | `instrument` | TEXT | part of PRIMARY KEY |
 | `chunk_no` | INTEGER | = chunk `start_seq`; part of PRIMARY KEY |
 | `count` | INTEGER | trades fetched for the chunk (default 0) |
-| `has_more` | INTEGER | API `has_more` for the chunk |
+| `has_more` | INTEGER | post-recovery range status persisted for the chunk |
 | `is_done` | INTEGER | 1 once finalized |
 
-A chunk is finalized (`is_done=1`) only when the API reports `has_more = 0` and either `count >= CHUNK_SIZE` or the future is expired. A full-sized response with `has_more = 1` remains pending because the server explicitly reports additional rows in the range. An active future's partial tail also remains pending because new trades can grow into the same fixed range; re-fetching may append duplicates, which the Parquet stage removes exactly. An expired future is marked complete once all its chunks are done.
+Each production task carries its exact expected `[start_seq, end_seq]`. The history host can shift a full response across the requested boundary, so the downloader filters out-of-range rows and checks the complete unique sequence set. An incomplete response is split into smaller ranges under a bounded recovery budget; only exact coverage is persisted with `has_more=0`. A chunk is then finalized (`is_done=1`) when its exact range is full or when it is the partial tail of an expired future. An active future's partial tail remains pending because new trades can grow into the same range; re-fetching may append duplicates, which the Parquet stage removes exactly.
 
 ### `option_meta` — per-instrument option state + resume offset
 

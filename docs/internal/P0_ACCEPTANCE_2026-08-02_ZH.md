@@ -11,7 +11,7 @@
 | 验收项 | 结果 | 证据 |
 |---|---|---|
 | 活跃 future 尾块跨运行增长 | 通过 | 部分尾块保持 pending；第二次增长会重新调度原尾块 |
-| `has_more=true` 的满响应 | 通过 | 即使 `count=CHUNK_SIZE` 也保持 pending |
+| `has_more=true` 的偏移满响应 | 通过 | 过滤越界行、拆分缺失区间；只在精确覆盖后完成 |
 | option 无序响应游标 | 通过 | `next_seq` 与 checkpoint 均取整批最大 `trade_seq` |
 | 降序/乱序跨批去重 | 通过 | 精确位图只删除真实重复键 |
 | 串行真实响应转换 | 通过 | 10000/10000 唯一键集合一致 |
@@ -21,7 +21,8 @@
 | 小文件解析失败 | 通过 | 异常上抛、旧产物保持、临时文件删除 |
 | 多进程 block 解析失败 | 通过 | 子进程异常上抛、旧产物保持、临时文件删除 |
 | 缺失/空输入目录 | 通过 | CLI 非零退出，不再打印假成功 |
-| 完整自动化测试 | 通过 | 138 passed（最终门禁结果见本记录末尾） |
+| 完整已过期 future 闭环 | 通过 | 68113/68113 唯一键，7/7 chunks 完成，validator `COMPLETE` |
+| 完整自动化测试 | 通过 | 142 passed（最终门禁结果见本记录末尾） |
 | 包构建 | 通过 | sdist 与 wheel 成功，生成物已清理 |
 
 ## 1. 线上 API 契约探针
@@ -51,7 +52,7 @@
 这条证据支持两项防御：
 
 1. 去重不能使用单个 `max_seen`；
-2. `count == CHUNK_SIZE` 不能覆盖服务器明确返回的 `has_more=true`。
+2. `count == CHUNK_SIZE` 与 `has_more` 都不能单独证明完整，必须核对请求范围内的精确序号集合。
 3. option 游标不能使用 `trades[0]`，必须扫描整批取最大 `trade_seq`。
 
 ### 1.3 默认 10000 序号范围
@@ -80,7 +81,7 @@ SQLite 状态回归覆盖：
 3. chunk 10001 返回 5000 行且 `has_more=false`，保持 pending；
 4. 第二次最新序号增长至 25000；
 5. pending 集合为 `{10001, 20001}`，不会直接跳过 15001..20000；
-6. 任意 `has_more=true` 的响应均不 finalize，即使返回行数等于 `CHUNK_SIZE`。
+6. 原始 `has_more=true` 响应不会直接 finalize；只有范围内唯一序号精确覆盖，或经拆分恢复后精确覆盖，才以完成状态持久化。
 
 对应测试位于 `tests/test_progress.py`。
 
@@ -128,6 +129,16 @@ key sets equal        = true
 
 将两页真实响应依次送入 `fetch_option_chunk`、`sync_option_db` 与 `JSONLinesSink` 后，SQLite 记录为 `last_no=10593, is_completed=1`。再运行项目原生 `gen_parquet.py` 和 checkpoint-aware `validate_data.py`：JSONL 与 Parquet 均为 10593 行/10593 个唯一键，键集合相等，序号范围 `1..10593`，validator 返回 `COMPLETE`（退出码 0）。临时验收数据位于 `/tmp/deribit-option-acceptance.PeiTNz`，不提交仓库。
 
+### 3.2 已过期 future 完整闭环与自愈
+
+选择 `BTC-10SEP21`，线上最终 `trade_seq=68113`，生产路径预分配 7 个 chunk。首次运行暴露了 history host 的真实边界泄漏：
+
+- `[30001, 40000]` 返回 10000 个唯一行但实际范围为 `30003..40003`，缺少 `30001/30002/30004`，并泄漏 `40001/40002/40003`，`has_more=true`；
+- 全部 7 个原始响应合计 68113 行，却只有 68110 个唯一键；两个 chunk 保持 pending，instrument 未被假标完成；
+- 修复后 pending chunk 携带精确 `end_seq`，过滤越界行，并在最多 32 次请求预算内二分重取不完整区间。
+
+直接对首次运行留下的 SQLite/JSONL 重启后，两个 pending chunk 均恢复为精确覆盖，7/7 chunk 与 `future_meta` 全部完成。JSONL 因安全重试共有 88113 行；Parquet 删除 20000 个重复后得到 68113 个唯一键，连续覆盖 `1..68113`，checkpoint-aware validator 返回 `COMPLETE`（退出码 0）。临时验收数据位于 `/tmp/deribit-future-acceptance.mAZrdb`，不提交仓库。
+
 ## 4. P0-3：故障注入验收
 
 自动化测试分别向小文件 reader 和多进程 block 注入非法 JSON，并预先放置一个“上一版正式产物”。两条路径都满足：
@@ -142,7 +153,7 @@ key sets equal        = true
 最终交付前执行：
 
 ```text
-pytest -q                 138 passed, coverage 83.54% (floor 80%)
+pytest -q                 142 passed, coverage 83.96% (floor 80%)
 ruff check .              passed
 ruff format --check .     passed
 pyrefly check             0 errors
@@ -152,7 +163,7 @@ uv build --offline        passed
 
 ## 6. 尚未完成的最终验收
 
-- [ ] 完整下载一个已过期 future，并将预期 `[1, last_seq]` 与 Parquet 唯一键集合对账；
+- [x] 完整下载一个已过期 future，并将预期 `[1, last_seq]` 与 Parquet 唯一键集合对账；
 - [ ] 对一个活跃 future 跨两个时间点运行，验证增量区间连续；
 - [x] 完整下载一个有多页成交的已过期 option；
 - [ ] BTC 与 ETH 各至少完成一个真实 instrument；

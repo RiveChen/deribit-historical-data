@@ -127,8 +127,8 @@ params = {
 ### `count` Parameter
 
 - **Observed history-host range**: 1 ~ 10,000 (`count=10,000` accepted on 2026-08-02)
-- **When count < actual data in range**: returns `count` trades, `has_more = true`
-- **When count >= actual data in range**: returns all trades, `has_more = false`
+- **Intended behavior**: `has_more` reflects a count-limited response within the requested range
+- **Observed caveat**: a 10,000-wide future range can return 10,000 unique rows shifted across the boundary with `has_more = true`; exact in-range key coverage is authoritative
 - **Note**: The current generic Deribit API reference states a 1,000 maximum, while `history.deribit.com` accepted and returned 10,000 rows in the 2026-08-02 production probe. Treat this as a history-host compatibility contract and monitor it for drift.
 
 ### `start_seq` and `end_seq` Parameters
@@ -229,7 +229,7 @@ The following 17 fields represent the union across all trade types. Core 10 fiel
 
 ### 5.1 The True Meaning of `has_more`
 
-**`has_more` = "within the requested [start_seq, end_seq] range, there are more trades not returned due to the count limit"**
+**`has_more` is intended to signal that the count limit omitted rows within `[start_seq, end_seq]`, but it is not a completeness proof.**
 
 ⚠️ It does **NOT** indicate "there is more data to fetch beyond start_seq".
 
@@ -246,7 +246,7 @@ Using `BTC-26JUN26` (last_seq = 1,912,937) as an example:
 
 **Impact on Code**:
 
-- **Future.py**: Uses `start_seq` ~ `end_seq` to pre-allocate all chunks. Since CHUNK_SIZE == count and the range exactly equals CHUNK_SIZE, `has_more` is normally false. As long as chunk seq intervals don't overlap (`[1,10000], [10001,20000]`...), no data is missed. ✅
+- **Future.py**: Carries the exact expected end bound, filters boundary leakage, and compares the unique sequence set with the full interval. Incomplete pages are split and re-fetched under a 32-request budget; only exact coverage is persisted as complete. ✅
 - **Option.py**: Uses `next_seq = max(trade_seq) + 1` to advance, independent of response ordering. A full response or `has_more=true` schedules another range. ✅
 
 ### 5.2 `trade_seq` Ordering
@@ -259,21 +259,21 @@ Using `BTC-26JUN26` (last_seq = 1,912,937) as an example:
 
 #### Test Results
 
-```
-BTC-27MAR26:
-  Chunk [1,10000]:  seqs [1..10000],  has_more=True
-  Chunk [10001,20000]: seqs [10001..20000], has_more=True
-  → Overlap: 1 duplicate trade_seq
+```text
+BTC-10SEP21 request [30001,40000]:
+  returned unique range [30003,40003], has_more=true
+  missing requested keys: 30001, 30002, 30004
+  leaked later keys:       40001, 40002, 40003
 ```
 
-- **Most chunks are strictly disjoint** (e.g., `BTC-30JAN26` and `BTC-27FEB26` chunks)
-- **Occasionally 1 trade_seq overlap at boundaries**, this is a minor Deribit server-side deviation
-- **Tolerance strategy**: JSONL allows minor duplicate rows; deduplication happens at Parquet export time by `(instrument_name, trade_seq)`
+- Responses do not always respect the requested closed interval, even when 10,000 unique rows are returned.
+- **Recovery strategy**: filter out-of-range rows, split an incomplete interval, and require the exact sequence set before checkpointing.
+- **Duplicate strategy**: restart-safe re-fetches may append duplicates to JSONL; Parquet removes them by `(instrument_name, trade_seq)`.
 
 ### 5.4 `count` Parameter and Pagination
 
 - The `count` parameter is a **per-request upper limit**, not a total count
-- When `count` is set to CHUNK_SIZE, and `end_seq - start_seq + 1` is also CHUNK_SIZE, `has_more` is determined by the actual amount of data within the range
+- A CHUNK_SIZE-wide range can still be shifted across boundaries; neither row count nor `has_more` proves coverage
 - **When actual data < count**: returns all current data, `has_more=false`. The chunk is final only if the instrument is expired; an active future's partial tail remains pending because the same range can grow later.
 
 ---
@@ -397,23 +397,22 @@ The following assumptions combine the original 2025-05-18 endpoint test with a p
 | 2 | trade_seq is monotonically increasing (new > old) | ✅ Confirmed |
 | 3 | Default results are strictly descending | ❌ Refuted; local inversions observed |
 | 4 | Future and Option trades share the same structure | ✅ Confirmed (10/10 fields) |
-| 5 | `has_more` indicates whether more data exists within the range | ✅ Confirmed, tied to count limit |
-| 6 | count=CHUNK_SIZE with exact range → has_more=false | Normally true; if false, keep pending |
+| 5 | `has_more` alone proves whether a range is complete | ❌ Refuted; exact in-range keys are required |
+| 6 | count=CHUNK_SIZE with exact range → has_more=false | ❌ Refuted by shifted full future pages |
 | 7 | `next_seq = max(trade_seq) + 1` can continue fetching | ✅ Confirmed |
 | 8 | Expired last chunk satisfies `count<CHUNK_SIZE AND has_more=0` → finalizable | ✅ Confirmed |
 | 9 | Starting from `start_seq=1` covers full history | ✅ Confirmed |
-| 10 | Chunk boundaries are mostly disjoint (occasional 1-trade overlap) | ✅ Confirmed |
+| 10 | Responses stay inside requested chunk boundaries | ❌ Refuted; boundary leakage observed |
 
 ---
 
 ## 9. Known Issues and Caveats
 
-### 9.1 Chunk Boundary 1-Trade Overlap
+### 9.1 Chunk Boundary Leakage
 
-- Tested on BTC-27MAR26: [1,10000] and [10001,20000] have 1 overlapping `trade_seq`
-- Likely a minor cursor offset issue in Deribit's server implementation
-- **Impact**: Duplicate rows in JSONL; deduplicated at Parquet export by `(instrument_name, trade_seq)`
-- **Severity**: Low (data correctness unaffected, only minor redundancy)
+- A BTC-10SEP21 `[30001,40000]` probe returned 10,000 unique rows spanning `30003..40003`, omitting three requested keys and leaking three later keys with `has_more=true`.
+- **Handling**: filter to the requested range, split incomplete ranges, and verify the exact unique sequence set before checkpointing.
+- **Restart behavior**: previously pending chunks can be re-fetched by the adaptive path; JSONL duplicates are removed during Parquet export.
 
 ### 9.2 Zero-Trade Instruments
 
@@ -424,9 +423,9 @@ The following assumptions combine the original 2025-05-18 endpoint test with a p
 
 ### 9.3 count Parameter Limit
 
-- Documented limit is 10,000, confirmed by testing
-- If count is set to 10,000 and the range is also 10,000, has_more always appears to be false (even if more data exists beyond)
-- **But the code logic does not depend on this behavior**: future uses exact seq partitioning, option uses next_seq to advance
+- The generic API reference documents a lower limit, while the history host accepted 10,000 in the 2026-08-02 probes.
+- A 10,000-wide range does not guarantee `has_more=false` or correct boundaries.
+- **The code does not trust this behavior**: future verifies exact range coverage; option advances from the maximum returned sequence.
 
 ### 9.4 Proxy Support
 

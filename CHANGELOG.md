@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Correctness, supervision, validation, retry, and bounded-reader defects identified by the 2026-08-02 audit. See `docs/internal/CODE_AUDIT_2026-08-02_ZH.md` for the commit-level evidence and remaining full-dataset acceptance gaps.
+- Future range responses now filter boundary leakage and adaptively split incomplete pages against their exact expected `trade_seq` interval instead of retrying the same permanently shifted page.
 
 ## [0.1.0] - 2026-07-17
 

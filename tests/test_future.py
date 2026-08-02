@@ -9,7 +9,12 @@ marked complete (which would permanently drop its entire trade history).
 import pytest
 import pytest_asyncio
 
-from deribit_fetcher.future import fetch_future_chunk, prepare_future_tasks, sync_future_db
+from deribit_fetcher.future import (
+    IncompleteTradeRangeError,
+    fetch_future_chunk,
+    prepare_future_tasks,
+    sync_future_db,
+)
 from deribit_fetcher.progress import DatabaseClient, FutureProgressRepo
 
 pytestmark = pytest.mark.asyncio
@@ -78,6 +83,19 @@ async def test_undetermined_seq_is_not_marked_complete(repo):
     assert await _chunk_count(repo, "BTC-FAIL") == 0, "failed lookup must allocate no chunks"
 
 
+async def test_undetermined_seq_does_not_run_existing_pending_chunk(repo):
+    """A restart without a trustworthy upper bound must leave old chunks pending."""
+    await _seed(repo, "BTC-FAIL")
+    await repo.upsert_chunks([("BTC-FAIL", 1)])
+    client = FakeClient({"BTC-FAIL": None})
+
+    pending = await prepare_future_tasks(repo, client, refresh_list=False)
+
+    assert pending == []
+    assert await _chunk_count(repo, "BTC-FAIL") == 1
+    assert await _is_completed(repo, "BTC-FAIL") == 0
+
+
 async def test_zero_seq_is_marked_complete(repo):
     """last_seq == 0 -> genuinely no trades -> marked complete, no chunks."""
     await _seed(repo, "BTC-EMPTY")
@@ -99,6 +117,11 @@ async def test_positive_seq_allocates_chunks(repo):
     assert await _is_completed(repo, "BTC-HAS") == 0
     assert await _chunk_count(repo, "BTC-HAS") == 3
     assert {c["chunk_no"] for c in pending} == {1, 10_001, 20_001}
+    assert {c["chunk_no"]: c["end_seq"] for c in pending} == {
+        1: 10_000,
+        10_001: 20_000,
+        20_001: 25_000,
+    }
 
 
 async def test_mixed_batch_isolates_failures(repo):
@@ -159,6 +182,68 @@ async def test_fetch_future_chunk_handles_no_trades():
     )
     assert result["data"] is None
     assert result["has_more"] is False
+
+
+class RangeClient:
+    """Return range-specific responses and record adaptive recovery calls."""
+
+    def __init__(self, responses):
+        """Initialize with responses keyed by inclusive sequence bounds."""
+        self.responses = responses
+        self.calls = []
+
+    async def get_trades_chunk(self, instrument, start_seq, end_seq):
+        """Return the configured response for one exact range."""
+        self.calls.append((start_seq, end_seq))
+        return self.responses[(start_seq, end_seq)]
+
+
+async def test_fetch_future_chunk_splits_shifted_full_response():
+    """A full but shifted API page must be split until every requested seq is present."""
+    client = RangeClient(
+        {
+            (1, 10): ([{"trade_seq": seq} for seq in range(3, 13)], True),
+            (1, 5): ([{"trade_seq": seq} for seq in range(1, 6)], False),
+            (6, 10): ([{"trade_seq": seq} for seq in range(6, 11)], False),
+        }
+    )
+
+    result = await fetch_future_chunk(
+        {"instrument": "BTC-SHIFTED", "chunk_no": 1, "end_seq": 10},
+        client=client,
+    )
+
+    assert client.calls == [(1, 10), (1, 5), (6, 10)]
+    assert {row["trade_seq"] for row in result["data"]} == set(range(1, 11))
+    assert result["has_more"] is False
+
+
+async def test_fetch_future_chunk_accepts_exact_coverage_despite_has_more():
+    """An unreliable has_more flag cannot override a proven exact sequence set."""
+    client = RangeClient(
+        {
+            (1, 3): ([{"trade_seq": 3}, {"trade_seq": 1}, {"trade_seq": 2}], True),
+        }
+    )
+
+    result = await fetch_future_chunk(
+        {"instrument": "BTC-EXACT", "chunk_no": 1, "end_seq": 3},
+        client=client,
+    )
+
+    assert client.calls == [(1, 3)]
+    assert result["has_more"] is False
+
+
+async def test_fetch_future_chunk_rejects_unrecoverable_empty_range():
+    """An expected non-empty range must fail instead of being marked complete."""
+    client = RangeClient({(1, 3): ([], False)})
+
+    with pytest.raises(IncompleteTradeRangeError, match="covered 0/3"):
+        await fetch_future_chunk(
+            {"instrument": "BTC-EMPTY-RANGE", "chunk_no": 1, "end_seq": 3},
+            client=client,
+        )
 
 
 class FakeSink:

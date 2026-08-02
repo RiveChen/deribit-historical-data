@@ -23,12 +23,12 @@ Guiding rule: **logic lives in the package, `scripts/` only parses args and call
 
 ```bash
 uv run pytest                 # full suite (+ coverage, configured in pyproject)
-uv run pytest tests/test_parquet.py -q
-uv run pytest -k dedup
+uv run pytest --no-cov tests/test_parquet.py -q  # focused iteration
+uv run pytest --no-cov -k dedup                  # focused iteration
 ```
 
 - Async tests run under `asyncio_mode = "auto"` (`[tool.pytest.ini_options]`), so `async def test_*` needs no per-test marker.
-- Coverage is on by default: `addopts = "--cov=deribit_fetcher --cov-report=term-missing"`. The `fail_under` threshold lives in `[tool.coverage.report]` — raise it as coverage improves so it can't regress.
+- Coverage is on by default: `addopts = "--cov=deribit_fetcher --cov-report=term-missing"`. The `fail_under` threshold lives in `[tool.coverage.report]`; focused runs use `--no-cov`, while the full suite remains the coverage gate.
 
 ### Current test modules
 

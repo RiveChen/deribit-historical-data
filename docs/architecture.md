@@ -71,7 +71,7 @@ The download side is a classic **bounded producer-consumer** pipeline built on `
 
 The engine is generic; the two fetchers differ only in callbacks:
 
-- **Future** — *pre-allocated* chunks. `last_seq` is known up front, so the whole `[1, last_seq]` range is partitioned into fixed chunks and fed as initial tasks. No `on_success`.
+- **Future** — *pre-allocated* chunks. `last_seq` is known up front, so the whole `[1, last_seq]` range is partitioned into tasks carrying exact start/end bounds. A shifted or incomplete API page is filtered and split until its in-range sequence set is exact (within a bounded recovery budget). No `on_success`.
 - **Option** — *streaming*. Each instrument starts one task at `last_no + 1`; `on_option_success` enqueues the next chunk only if `should_continue`, so the task set grows dynamically as the progress bar total expands.
 
 See [design-decisions.md](./design-decisions.md) for *why* the two strategies differ.

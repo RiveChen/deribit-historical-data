@@ -17,6 +17,7 @@
 | 串行真实响应转换 | 通过 | 10000/10000 唯一键集合一致 |
 | 2 进程真实响应转换 | 通过 | 10000/10000 唯一键集合一致 |
 | 真实样本 Parquet 校验 | 通过 | 18 列、10000 行、序号范围连续、0 gap |
+| 已过期 option 两页闭环 | 通过 | 10593/10593 唯一键集合一致；checkpoint `completed=1`；validator `COMPLETE` |
 | 小文件解析失败 | 通过 | 异常上抛、旧产物保持、临时文件删除 |
 | 多进程 block 解析失败 | 通过 | 子进程异常上抛、旧产物保持、临时文件删除 |
 | 缺失/空输入目录 | 通过 | CLI 非零退出，不再打印假成功 |
@@ -117,6 +118,16 @@ key sets equal        = true
 
 同一线上证据还推动了 option 游标修复：`fetch_option_chunk` 不再假定第一行最大，而是取整批 `max(trade_seq)`；`sync_option_db` 也扫描每个 item 的全部成交后再更新 checkpoint。回归测试明确构造第一行不是最大值的响应。
 
+### 3.1 已过期 option 两页闭环
+
+选择公开历史 instrument `BTC-27JUN25-100000-C`。`count=1` 探针给出的最终 `trade_seq` 为 10593；随后按生产配置的 10000 序号区间读取：
+
+- `[1, 10000]` 返回 10000 行、10000 个唯一序号、`has_more=false`；尽管服务端没有跨区间提示更多数据，`fetch_option_chunk` 仍因满页正确产生 `next_seq=10001`；
+- `[10001, 20000]` 返回 593 行、593 个唯一序号、`has_more=false`，已过期 instrument 被标记完成；
+- 两页分别出现 463 与 14 次局部升序，继续证明响应顺序不能作为游标或去重不变量。
+
+将两页真实响应依次送入 `fetch_option_chunk`、`sync_option_db` 与 `JSONLinesSink` 后，SQLite 记录为 `last_no=10593, is_completed=1`。再运行项目原生 `gen_parquet.py` 和 checkpoint-aware `validate_data.py`：JSONL 与 Parquet 均为 10593 行/10593 个唯一键，键集合相等，序号范围 `1..10593`，validator 返回 `COMPLETE`（退出码 0）。临时验收数据位于 `/tmp/deribit-option-acceptance.PeiTNz`，不提交仓库。
+
 ## 4. P0-3：故障注入验收
 
 自动化测试分别向小文件 reader 和多进程 block 注入非法 JSON，并预先放置一个“上一版正式产物”。两条路径都满足：
@@ -143,7 +154,7 @@ uv build --offline        passed
 
 - [ ] 完整下载一个已过期 future，并将预期 `[1, last_seq]` 与 Parquet 唯一键集合对账；
 - [ ] 对一个活跃 future 跨两个时间点运行，验证增量区间连续；
-- [ ] 完整下载一个有多页成交的已过期 option；
+- [x] 完整下载一个有多页成交的已过期 option；
 - [ ] BTC 与 ETH 各至少完成一个真实 instrument；
 - [ ] 在接近目标数据规模的输入上记录峰值 RSS、吞吐和临时磁盘占用；
 - [x] 处理审计报告中的 P1：动态队列死锁、consumer 失败监督、并行内存增长、校验盲区（代码级回归已通过；真实规模 RSS 单列在上一项）。

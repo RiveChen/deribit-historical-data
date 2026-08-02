@@ -234,6 +234,36 @@ class TestExactDedup:
         result = pl.read_parquet(output)
         assert sorted(result["trade_seq"].to_list()) == [1, 2, 3, 4, 5]
 
+    @pytest.mark.parametrize(
+        "generation_options",
+        [
+            {"large_file_threshold": 10_000},
+            {"large_file_threshold": 1, "stream_batch_size": 2},
+            {
+                "large_file_threshold": 1,
+                "stream_workers": 2,
+                "block_bytes": 64,
+            },
+        ],
+        ids=["small-file", "serial-stream", "parallel-blocks"],
+    )
+    def test_no_dedup_preserves_every_valid_input_row(self, tmp_path, generation_options):
+        """dedup=False must preserve duplicates through every reader path."""
+        data_dir = tmp_path / "future"
+        data_dir.mkdir()
+        source = data_dir / "BTC-TEST.jsonl"
+        source.write_text(
+            "".join(
+                f'{{"trade_seq":{seq},"instrument_name":"BTC-TEST","timestamp":1}}\n'
+                for seq in [1, 1, 2]
+            )
+        )
+        output = tmp_path / "future.parquet"
+
+        generate_parquet(data_dir, output, dedup=False, **generation_options)
+
+        assert pl.read_parquet(output)["trade_seq"].to_list() == [1, 1, 2]
+
 
 class TestAtomicParquetGeneration:
     """A partial conversion must never be published as a successful output."""

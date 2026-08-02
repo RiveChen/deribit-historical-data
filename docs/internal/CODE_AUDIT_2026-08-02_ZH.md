@@ -5,7 +5,7 @@
 审计范围：`src/deribit_fetcher/`、`scripts/`、`tests/`、构建配置、CI 与核心文档
 审计方式：静态代码审查、现有测试/质量门禁、最小可复现实验；未连接 Deribit 线上 API，也未使用真实 90 GB 数据集做端到端核验。
 
-> **审计后修复状态（2026-08-02）**：本报告识别的三个 P0 已在提交 `8d97623` 修复。P0-1 让活跃 future 的部分尾块以及任何 `has_more=true` 的响应保持 pending；P0-2 以顺序无关的精确位图替代生产路径中的 `max_seen` 过滤，并让 option 游标/checkpoint 显式取整批最大 `trade_seq`；P0-3 改为失败向上抛出、同目录临时文件写入并原子替换。P1-1/P1-2 已在提交 `ca523cd` 修复：任务队列保持严格有界并为 worker 的单个 follow-up/retry 预留槽位，consumer 失败会被主流程立即监督和传播。P1-3 已在后续工作树修复：validator 以 SQLite checkpoint 为 inventory 和已知边界，输出 `COMPLETE` / `INCOMPLETE` / `UNKNOWN` 并使用不同退出码。完整回归现为 **124 passed**，总覆盖率 **81%**；真实 BTC-PERPETUAL 10000 条样本在串行与 2 进程路径均完成唯一键集合对账。下文保留修复前的发现、复现和验收依据；P1-4/P1-5 与 P2 尚未处理。
+> **审计后修复状态（2026-08-02）**：本报告识别的三个 P0 已在提交 `8d97623` 修复。P0-1 让活跃 future 的部分尾块以及任何 `has_more=true` 的响应保持 pending；P0-2 以顺序无关的精确位图替代生产路径中的 `max_seen` 过滤，并让 option 游标/checkpoint 显式取整批最大 `trade_seq`；P0-3 改为失败向上抛出、同目录临时文件写入并原子替换。P1-1/P1-2 已在提交 `ca523cd` 修复：任务队列保持严格有界并为 worker 的单个 follow-up/retry 预留槽位，consumer 失败会被主流程立即监督和传播。P1-3 已在提交 `7e247b3` 修复：validator 以 SQLite checkpoint 为 inventory 和已知边界，输出 `COMPLETE` / `INCOMPLETE` / `UNKNOWN` 并使用不同退出码。P1-4 已在后续工作树修复：`dedup=False` 贯穿小文件、串行大文件和并行 block reader。完整回归现为 **127 passed**，总覆盖率 **82%**；真实 BTC-PERPETUAL 10000 条样本在串行与 2 进程路径均完成唯一键集合对账。下文保留修复前的发现、复现和验收依据；P1-5 与 P2 尚未处理。
 
 ## 1. 结论
 
@@ -186,6 +186,8 @@
 建议把“结构校验”和“全量校验”拆开。全量校验必须读取下载清单/检查点：对每个 instrument 比较预期起点、目标 `last_seq`、唯一键数与实际边界；无法取得目标边界时输出 `UNKNOWN`，不能输出成功。
 
 ### P1-4：`--no-dedup` 没有真正关闭去重
+
+> **修复状态：已修复。** `dedup` 参数现已传入 `read_and_dedup_file`、`stream_batches`、`parallel_read_large_file` 及其子进程 block worker；关闭时不执行 intra-file、intra-batch、cross-block 或 merge 层去重。含 `[1, 1, 2]` 的同一输入在小文件、串行流式、2 进程 block 三条生成路径中均输出 3 行；默认开启去重的原有精确位图测试保持通过。
 
 `read_and_dedup_file`、`stream_batches` 和 `_process_block` 都无条件调用 `dedup_intra`；多进程路径还无条件执行跨 block 去重。`dedup=False` 只关闭外层部分跨批/跨文件逻辑。
 

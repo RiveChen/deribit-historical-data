@@ -18,6 +18,8 @@
 | 2 进程真实响应转换 | 通过 | 10000/10000 唯一键集合一致 |
 | 真实样本 Parquet 校验 | 通过 | 18 列、10000 行、序号范围连续、0 gap |
 | 已过期 option 两页闭环 | 通过 | 10593/10593 唯一键集合一致；checkpoint `completed=1`；validator `COMPLETE` |
+| ETH 已过期 future 闭环 | 通过 | 7107/7107 唯一键集合一致；validator `COMPLETE` |
+| 活跃 BTC future 跨时间增长 | 通过 | 高水位增长 7；重取后唯一序号连续；tail 保持 pending |
 | 小文件解析失败 | 通过 | 异常上抛、旧产物保持、临时文件删除 |
 | 多进程 block 解析失败 | 通过 | 子进程异常上抛、旧产物保持、临时文件删除 |
 | 缺失/空输入目录 | 通过 | CLI 非零退出，不再打印假成功 |
@@ -139,6 +141,14 @@ key sets equal        = true
 
 直接对首次运行留下的 SQLite/JSONL 重启后，两个 pending chunk 均恢复为精确覆盖，7/7 chunk 与 `future_meta` 全部完成。JSONL 因安全重试共有 88113 行；Parquet 删除 20000 个重复后得到 68113 个唯一键，连续覆盖 `1..68113`，checkpoint-aware validator 返回 `COMPLETE`（退出码 0）。临时验收数据位于 `/tmp/deribit-future-acceptance.mAZrdb`，不提交仓库。
 
+### 3.3 ETH 已过期 future 闭环
+
+选择 `ETH-29MAR19`，通过生产 `DeribitClient + run_fetcher + FutureProgressRepo` 下载最终序号 `7107`。单个 chunk 记录为 `(chunk_no=1, count=7107, has_more=0, is_done=1)`，instrument 标记完成。JSONL 与 Parquet 均为 7107 个唯一键、连续覆盖 `1..7107`，validator 返回 `COMPLETE`。临时数据位于 `/tmp/deribit-eth-acceptance.yr6Pm6`。
+
+### 3.4 活跃 BTC future 跨时间增长
+
+对 `BTC-PERPETUAL` 的同一活跃尾 chunk 在两个时间点运行生产 fetch/sync 逻辑：高水位由 `295694836` 增长到 `295694843`（新增 7）。第一次与第二次分别从固定 chunk 起点取到各自高水位，JSONL 合计 9679 行；去重后 4843 个序号，精确连续覆盖 chunk 起点至第二个高水位。SQLite 的 active tail `is_done` 始终为 0，既没有漏掉新增区间，也没有把仍会增长的尾块永久完成。临时数据位于 `/tmp/deribit-active-acceptance.RFG8PI`。
+
 ## 4. P0-3：故障注入验收
 
 自动化测试分别向小文件 reader 和多进程 block 注入非法 JSON，并预先放置一个“上一版正式产物”。两条路径都满足：
@@ -164,9 +174,9 @@ uv build --offline        passed
 ## 6. 尚未完成的最终验收
 
 - [x] 完整下载一个已过期 future，并将预期 `[1, last_seq]` 与 Parquet 唯一键集合对账；
-- [ ] 对一个活跃 future 跨两个时间点运行，验证增量区间连续；
+- [x] 对一个活跃 future 跨两个时间点运行，验证增量区间连续；
 - [x] 完整下载一个有多页成交的已过期 option；
-- [ ] BTC 与 ETH 各至少完成一个真实 instrument；
+- [x] BTC 与 ETH 各至少完成一个真实 instrument；
 - [ ] 在接近目标数据规模的输入上记录峰值 RSS、吞吐和临时磁盘占用；
 - [x] 处理审计报告中的 P1：动态队列死锁、consumer 失败监督、并行内存增长、校验盲区（代码级回归已通过；真实规模 RSS 单列在上一项）。
 

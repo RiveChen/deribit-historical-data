@@ -7,7 +7,7 @@
 
 > A resumable async downloader for historical **Futures** and **Options** trades from the [Deribit History API v2](https://docs.deribit.com/#public-get_last_trades_by_instrument).
 
-> **Verification status:** correctness regressions, one complete 68113-row expired BTC future, and one complete 10593-row expired BTC option pass. Full currency/kind datasets and 90 GB peak RSS are not yet certified. Use checkpoint-aware validation before treating an export as complete.
+> **Verification status:** correctness regressions, complete expired BTC future/option instruments, one complete expired ETH future, and a two-point active BTC tail pass. Full currency/kind datasets and 90 GB peak RSS are not yet certified. Use checkpoint-aware validation before treating an export as complete.
 
 *If it helps, stars are appreciated!* ⭐
 

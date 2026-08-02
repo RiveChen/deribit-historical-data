@@ -24,11 +24,12 @@ Run these locally — CI runs the same checks on Python 3.10 / 3.11 / 3.12.
 
 ```bash
 uv run pytest              # tests (+ coverage, configured in pyproject.toml)
-uvx ruff check .           # lint
-uvx ruff format --check .  # formatting
+uv run ruff check .        # lint
+uv run ruff format --check .
+uv run pyrefly check --search-path . --search-path src
 ```
 
-All three must pass.
+All four must pass.
 
 ## Project conventions
 

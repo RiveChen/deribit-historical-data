@@ -25,7 +25,13 @@ jobs:
         run: uv sync --all-extras --dev
 
       - name: Run ruff lint
-        run: uvx ruff check .
+        run: uv run ruff check .
+
+      - name: Check ruff formatting
+        run: uv run ruff format --check .
+
+      - name: Run pyrefly type checks
+        run: uv run pyrefly check --search-path . --search-path src
 
   test:
     runs-on: ubuntu-latest

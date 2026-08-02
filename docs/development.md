@@ -6,7 +6,7 @@
 uv sync                     # install runtime + dev dependencies
 ```
 
-Dev dependencies (`[dependency-groups].dev`): `pytest`, `pytest-asyncio`, `pytest-cov`. Lint/format via `ruff` (run with `uvx ruff`).
+Dev dependencies (`[dependency-groups].dev`): `pytest`, `pytest-asyncio`, `pytest-cov`, `ruff`, and `pyrefly`.
 
 ## Project layout
 
@@ -52,9 +52,10 @@ uv run pytest -k dedup
 ## Lint & format (ruff)
 
 ```bash
-uvx ruff check .            # lint
-uvx ruff format .          # apply formatting
-uvx ruff format --check .  # verify only (what CI runs)
+uv run ruff check .            # lint
+uv run ruff format .           # apply formatting
+uv run ruff format --check .   # verify only (what CI runs)
+uv run pyrefly check --search-path . --search-path src
 ```
 
 Config in `[tool.ruff]`: line length 100, rule sets `E,W,F,I,N,D,UP,B`, google docstring convention, double-quote style. Fix findings or add a justified `# noqa: <code>`.
@@ -63,8 +64,8 @@ Config in `[tool.ruff]`: line length 100, rule sets `E,W,F,I,N,D,UP,B`, google d
 
 `.github/workflows/ci.yml` runs on push/PR to `main`:
 
-- **lint** job: `ruff check .` (Python 3.12).
-- **test** job: `uv sync` + `pytest` across Python **3.10 / 3.11 / 3.12** (`fail-fast: false`).
+- **lint** job: Ruff lint, Ruff format check, and Pyrefly type checking (Python 3.12).
+- **test** job: `uv sync` + `pytest` across Python **3.10 / 3.11 / 3.12** (`fail-fast: false`), with an 80% coverage floor.
 
 Keep the suite green before merging.
 

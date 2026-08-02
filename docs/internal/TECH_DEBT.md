@@ -1,5 +1,7 @@
 # Tech Debt Audit — deribit-historical-data
 
+> **Historical snapshot.** This records the original audit inputs, not current completion state. Use `CODE_AUDIT_2026-08-02_ZH.md` and executable CI checks for current status.
+
 _Audit date: 2026-06-28 · Scope: `src/deribit_fetcher/`, `scripts/`, `tests/` (~2,450 LOC)_
 
 ## Summary

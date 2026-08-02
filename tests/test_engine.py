@@ -4,7 +4,7 @@ import asyncio
 
 import pytest
 
-from deribit_fetcher.engine import FetcherEngine
+from deribit_fetcher.engine import FetcherEngine, FetchTasksFailedError
 
 pytestmark = pytest.mark.asyncio
 
@@ -166,15 +166,17 @@ class TestGracefulShutdown:
 
         tasks = [{"id": 1}]
 
-        await engine.run(
-            initial_tasks=tasks,
-            fetch_func=always_fail,
-            sync_db_func=noop_sync,
-            stop_event=stop_event,
-        )
+        with pytest.raises(FetchTasksFailedError) as error:
+            await engine.run(
+                initial_tasks=tasks,
+                fetch_func=always_fail,
+                sync_db_func=noop_sync,
+                stop_event=stop_event,
+            )
 
         assert len(engine.dead_letters) == 1, "Failed task should be in dead_letters"
         assert engine.dead_letters[0]["id"] == 1
+        assert error.value.dead_letters == engine.dead_letters
 
     async def test_dead_letter_does_not_block_other_tasks(self, engine):
         """A permanently failing task should not prevent a healthy task from succeeding."""
@@ -193,12 +195,13 @@ class TestGracefulShutdown:
 
         tasks = [{"id": "fail"}, {"id": "ok"}]
 
-        await engine.run(
-            initial_tasks=tasks,
-            fetch_func=mixed_fetch,
-            sync_db_func=noop_sync,
-            stop_event=stop_event,
-        )
+        with pytest.raises(FetchTasksFailedError, match="1 fetch task"):
+            await engine.run(
+                initial_tasks=tasks,
+                fetch_func=mixed_fetch,
+                sync_db_func=noop_sync,
+                stop_event=stop_event,
+            )
 
         assert success_flag is True, "Healthy task should complete"
         assert len(engine.dead_letters) == 1, "Exactly one dead-letter"

@@ -1,5 +1,7 @@
 """Tests for progress.py: database finalize/resume logic."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 import pytest_asyncio
 
@@ -276,6 +278,17 @@ class TestOptionProgressRepo:
         )
         row = await cur.fetchone()
         assert row["last_no"] == 200, "last_no should increase"
+
+    async def test_update_option_last_no_propagates_database_failure(self):
+        """A failed checkpoint write must fail the pipeline rather than log and continue."""
+        failing_db = AsyncMock()
+        failing_db.executemany.side_effect = OSError("simulated checkpoint failure")
+        repo = OptionProgressRepo(failing_db)
+
+        with pytest.raises(OSError, match="simulated checkpoint failure"):
+            await repo.update_option_last_no([(200, "BTC-OPTION-1")])
+
+        failing_db.commit.assert_not_awaited()
 
     async def test_get_incomplete_excludes_completed(self, option_repo):
         """get_incomplete_option_list should only return is_completed=0 instruments."""

@@ -255,5 +255,6 @@ class OptionProgressRepo:
         try:
             await self.db.executemany(sql, updates)
             await self.db.commit()
-        except Exception as e:
-            logger.error(f"Failed to update option progress: {e}")
+        except Exception:
+            logger.exception("Failed to update option progress")
+            raise

@@ -13,6 +13,22 @@ from deribit_fetcher.config import logger
 MAX_TASK_RETRIES = 3
 
 
+class FetchTasksFailedError(RuntimeError):
+    """Raised after all safely persistable results drain when tasks exhaust retries."""
+
+    def __init__(self, dead_letters: list[dict]):
+        """Store failed task snapshots and build a concise operational message."""
+        self.dead_letters = [dict(task) for task in dead_letters]
+        identifiers = [
+            str(task.get("instrument", task.get("id", "?"))) for task in self.dead_letters[:5]
+        ]
+        suffix = " ..." if len(self.dead_letters) > 5 else ""
+        super().__init__(
+            f"{len(self.dead_letters)} fetch task(s) exhausted retries: "
+            f"{', '.join(identifiers)}{suffix}"
+        )
+
+
 class FetcherEngine:
     """Generic async producer-consumer engine for data fetching workloads.
 
@@ -325,3 +341,6 @@ class FetcherEngine:
             finally:
                 pbar.close()
             logger.info("Engine run completed.")
+
+        if self.dead_letters:
+            raise FetchTasksFailedError(self.dead_letters)

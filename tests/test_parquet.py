@@ -13,6 +13,7 @@ import pytest
 
 from deribit_fetcher.parquet import (
     SeenTradeSeqs,
+    _bounded_ordered_map,
     _split_blocks,
     dedup_cross_batch,
     dedup_cross_file,
@@ -86,6 +87,47 @@ def _expected_counts_of_full(expected_total: int, seq_min: int = 1) -> dict[int,
         .collect()
     )
     return dict(result.iter_rows())
+
+
+class TestBoundedOrderedMap:
+    """The executor adapter must cap retained futures and preserve input order."""
+
+    def test_never_retains_more_than_configured_window(self):
+        """Submission count minus consumed results never exceeds the window."""
+
+        class FakeFuture:
+            def __init__(self, executor, value):
+                self.executor = executor
+                self.value = value
+
+            def result(self):
+                self.executor.outstanding -= 1
+                return self.value
+
+            def cancel(self):
+                self.executor.outstanding -= 1
+
+        class FakeExecutor:
+            def __init__(self):
+                self.outstanding = 0
+                self.max_outstanding = 0
+
+            def submit(self, fn, item):
+                self.outstanding += 1
+                self.max_outstanding = max(self.max_outstanding, self.outstanding)
+                return FakeFuture(self, fn(item))
+
+        executor = FakeExecutor()
+        results = list(_bounded_ordered_map(executor, lambda value: value * 2, range(20), 3))
+
+        assert results == [value * 2 for value in range(20)]
+        assert executor.max_outstanding == 3
+        assert executor.outstanding == 0
+
+    def test_rejects_nonpositive_window(self):
+        """A zero-size window cannot make progress and is rejected explicitly."""
+        with pytest.raises(ValueError, match="max_inflight must be positive"):
+            list(_bounded_ordered_map(None, lambda value: value, [], 0))
 
 
 # =============================================================================

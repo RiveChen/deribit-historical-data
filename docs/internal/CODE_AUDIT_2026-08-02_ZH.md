@@ -5,7 +5,7 @@
 审计范围：`src/deribit_fetcher/`、`scripts/`、`tests/`、构建配置、CI 与核心文档
 审计方式：静态代码审查、现有测试/质量门禁、最小可复现实验；未连接 Deribit 线上 API，也未使用真实 90 GB 数据集做端到端核验。
 
-> **审计后修复状态（2026-08-02）**：本报告识别的三个 P0 已在提交 `8d97623` 修复。P0-1 让活跃 future 的部分尾块以及任何 `has_more=true` 的响应保持 pending；P0-2 以顺序无关的精确位图替代生产路径中的 `max_seen` 过滤，并让 option 游标/checkpoint 显式取整批最大 `trade_seq`；P0-3 改为失败向上抛出、同目录临时文件写入并原子替换。P1-1/P1-2 已在提交 `ca523cd` 修复：任务队列保持严格有界并为 worker 的单个 follow-up/retry 预留槽位，consumer 失败会被主流程立即监督和传播。P1-3 已在提交 `7e247b3` 修复：validator 以 SQLite checkpoint 为 inventory 和已知边界，输出 `COMPLETE` / `INCOMPLETE` / `UNKNOWN` 并使用不同退出码。P1-4 已在后续工作树修复：`dedup=False` 贯穿小文件、串行大文件和并行 block reader。完整回归现为 **127 passed**，总覆盖率 **82%**；真实 BTC-PERPETUAL 10000 条样本在串行与 2 进程路径均完成唯一键集合对账。下文保留修复前的发现、复现和验收依据；P1-5 与 P2 尚未处理。
+> **审计后修复状态（2026-08-02）**：本报告识别的三个 P0 已在提交 `8d97623` 修复。P0-1 让活跃 future 的部分尾块以及任何 `has_more=true` 的响应保持 pending；P0-2 以顺序无关的精确位图替代生产路径中的 `max_seen` 过滤，并让 option 游标/checkpoint 显式取整批最大 `trade_seq`；P0-3 改为失败向上抛出、同目录临时文件写入并原子替换。P1-1/P1-2 已在提交 `ca523cd` 修复：任务队列保持严格有界并为 worker 的单个 follow-up/retry 预留槽位，consumer 失败会被主流程立即监督和传播。P1-3 已在提交 `7e247b3` 修复：validator 以 SQLite checkpoint 为 inventory 和已知边界，输出 `COMPLETE` / `INCOMPLETE` / `UNKNOWN` 并使用不同退出码。P1-4 已在提交 `62bec2c` 修复：`dedup=False` 贯穿全部 reader。P1-5 的代码级内存放大已在后续工作树修复：进程/线程池均采用 `2 × workers` 固定窗口，并删除无用的逐文件 `set[int]`。完整回归现为 **129 passed**，总覆盖率 **82%**；真实 BTC-PERPETUAL 10000 条样本在串行与 2 进程路径均完成唯一键集合对账。下文保留修复前的发现、复现和验收依据；90 GB 峰值 RSS 实测与 P2 尚未处理。
 
 ## 1. 结论
 
@@ -196,6 +196,8 @@
 建议让 dedup 策略显式贯穿所有 reader，或移除该开关并把行为写清。验收应断言 `--no-dedup` 输出行数与原始有效 JSON 行数一致。
 
 ### P1-5：所谓“有界内存”没有覆盖并行路径
+
+> **修复状态：代码级修复完成，真实规模基准待执行。** 大文件 reader 不再调用 `list(pool.map(...))`，而是按 block 输入顺序维护最多 `2 × workers` 个 Future，消费一个才提交一个；小文件线程池采用相同固定窗口，不再为全部文件一次性建 Future 字典；`read_and_dedup_file` 也不再构造从未使用的逐文件 `set[int]`。调度器测试验证 20 个任务、窗口 3 时最大 outstanding 始终为 3，现有串行/并行结果一致性测试保持通过。由于本次仍未运行真实 90 GB 数据，峰值 RSS 的工程结论保持“待实测”。
 
 - `parquet.py:219-223` 用 `results = list(pool.map(...))` 一次保留大文件全部 block 的 DataFrame；90 GB 输入可能在父进程聚合数百个反序列化结果；
 - `parquet.py:494-501` 的 `futures` 字典在阶段结束前保留每个 Future，而 Future 会持有其 DataFrame 结果；

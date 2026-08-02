@@ -5,6 +5,7 @@ the output by checking trade_seq continuity for each instrument.
 """
 
 import concurrent.futures
+import functools
 import io
 import logging
 import mmap
@@ -12,6 +13,7 @@ import multiprocessing as mp
 import os
 import sqlite3
 import tempfile
+from collections import deque
 from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -60,6 +62,33 @@ MAX_PENDING_TABLES = 50
 LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100 MB
 DEFAULT_BLOCK_BYTES = 100 * 1024 * 1024  # 100 MB per block for parallel reading
 DEFAULT_STREAM_WORKERS = 4
+INFLIGHT_TASKS_PER_WORKER = 2
+
+
+def _bounded_ordered_map(executor, fn, items, max_inflight: int):
+    """Map work in input order while retaining at most ``max_inflight`` futures."""
+    if max_inflight < 1:
+        raise ValueError("max_inflight must be positive")
+
+    item_iterator = iter(items)
+    pending = deque()
+    for _ in range(max_inflight):
+        try:
+            pending.append(executor.submit(fn, next(item_iterator)))
+        except StopIteration:
+            break
+
+    try:
+        while pending:
+            future = pending.popleft()
+            yield future.result()
+            try:
+                pending.append(executor.submit(fn, next(item_iterator)))
+            except StopIteration:
+                continue
+    finally:
+        for future in pending:
+            future.cancel()
 
 
 # ---------------------------------------------------------------------------
@@ -175,12 +204,12 @@ def dedup_cross_file(df: pl.DataFrame, seen_keys: set[int] | None) -> tuple[pl.D
 def read_and_dedup_file(
     f: Path,
     dedup: bool = True,
-) -> tuple[str, pl.DataFrame | None, int, str | None, set[int] | None]:
+) -> tuple[str, pl.DataFrame | None, int, str | None]:
     """Read one JSONL file and optionally deduplicate rows within it."""
     try:
         df = pl.read_ndjson(f, schema=COMPREHENSIVE_SCHEMA)
         if df.is_empty():
-            return (f.name, None, 0, None, None)
+            return (f.name, None, 0, None)
 
         intra_dup = 0
         if dedup:
@@ -189,9 +218,7 @@ def read_and_dedup_file(
             logger.debug(f"{f.name}: removed {intra_dup} intra-file dups")
 
         instr_name = str(df["instrument_name"][0])
-        seq_set = set(int(v) for v in df["trade_seq"].to_list())
-
-        return (f.name, df, intra_dup, instr_name, seq_set)
+        return (f.name, df, intra_dup, instr_name)
     except Exception as e:
         raise RuntimeError(f"Failed to process JSONL file {f}") from e
 
@@ -201,7 +228,7 @@ def read_and_dedup_file(
 #
 # A large file is split into \n-aligned byte blocks; each block is processed
 # in a separate subprocess (true parallelism, not GIL-bound).  Results are
-# sorted by block offset to restore file order before cross-block dedup.
+# consumed through a bounded ordered window before cross-block dedup.
 # ---------------------------------------------------------------------------
 
 
@@ -287,33 +314,32 @@ def parallel_read_large_file(
 
     fname = file_path.name
 
-    # Process blocks — use spawn context for Linux/macOS safety
-    ctx = mp.get_context("spawn")
-    with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
-        args = [(file_path, start, end, dedup) for start, end in blocks]
-        results = list(pool.map(_process_block, args))
-
-    # Sort by block start offset to restore file order
-    results.sort(key=lambda r: r[0])
-
     # Cross-block dedup must be exact: API responses are descending within a
     # chunk and concurrently-written future chunks may appear in any order.
     seen_by_instrument: dict[str, SeenTradeSeqs] = {}
 
-    for start_offset, df, intra_dup, instr in results:
-        if df is None or df.is_empty():
-            continue
-
-        if dedup:
-            df, cross_dup = dedup_exact(df, seen_by_instrument)
-            if cross_dup:
-                logger.debug(
-                    f"{fname}[block offset={start_offset}]: removed {cross_dup} cross-block dups"
-                )
-            if df.is_empty():
+    # Keep only a small ordered window of deserialized DataFrames in the parent
+    # process. This preserves block order without collecting the whole file.
+    ctx = mp.get_context("spawn")
+    max_inflight = max(1, workers * INFLIGHT_TASKS_PER_WORKER)
+    args = ((file_path, start, end, dedup) for start, end in blocks)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as pool:
+        results = _bounded_ordered_map(pool, _process_block, args, max_inflight)
+        for start_offset, df, intra_dup, instr in results:
+            if df is None or df.is_empty():
                 continue
 
-        yield (fname, df, intra_dup, instr, start_offset)
+            if dedup:
+                df, cross_dup = dedup_exact(df, seen_by_instrument)
+                if cross_dup:
+                    logger.debug(
+                        f"{fname}[block offset={start_offset}]: "
+                        f"removed {cross_dup} cross-block dups"
+                    )
+                if df.is_empty():
+                    continue
+
+            yield (fname, df, intra_dup, instr, start_offset)
 
 
 # ---------------------------------------------------------------------------
@@ -538,7 +564,6 @@ def generate_parquet(
                 df: pl.DataFrame | None,
                 intra_dup: int,
                 instr_name: str | None,
-                seq_set: set[int] | None,
             ) -> None:
                 nonlocal total_rows, total_duplicates
                 total_duplicates += intra_dup
@@ -562,10 +587,16 @@ def generate_parquet(
                     _flush_pending()
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
-                futures = {executor.submit(read_and_dedup_file, f, dedup): f for f in small_files}
+                max_inflight = max(1, effective_workers * INFLIGHT_TASKS_PER_WORKER)
+                reader = functools.partial(read_and_dedup_file, dedup=dedup)
+                results = _bounded_ordered_map(
+                    executor,
+                    reader,
+                    small_files,
+                    max_inflight,
+                )
                 with tqdm(total=n_small, desc=f"Writing {output_file.name}", unit="file") as pbar:
-                    for future in concurrent.futures.as_completed(futures):
-                        result = future.result()
+                    for result in results:
                         _consume_small(*result)
                         processed_count += 1
                         pbar.update(1)

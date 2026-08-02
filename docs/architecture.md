@@ -80,5 +80,5 @@ See [design-decisions.md](./design-decisions.md) for *why* the two strategies di
 
 `parquet.py` is independent of the async download stack (pure `polars`/`pyarrow`/stdlib), which makes its dedup logic unit-testable in isolation. It classifies files by size:
 
-- **Small files** (`< --large-threshold-mb`) → thread pool, one file per worker, per-file dedup.
-- **Large files** (`≥ threshold`) → either single-thread `mmap` streaming in row batches, or a **process pool** (`--stream-workers`) that reads `\n`-aligned byte blocks in true parallel. Cross-batch dedup uses an exact per-instrument sequence bitmap, so correctness does not depend on JSONL row order.
+- **Small files** (`< --large-threshold-mb`) → thread pool with a fixed `2 × workers` inflight window, one file per task, optional per-file dedup.
+- **Large files** (`≥ threshold`) → either single-thread `mmap` streaming in row batches, or a **process pool** (`--stream-workers`) that reads `\n`-aligned byte blocks in true parallel. The process path also uses a fixed `2 × workers` ordered result window instead of retaining every block DataFrame. Cross-batch dedup uses an exact per-instrument sequence bitmap, so correctness does not depend on JSONL row order.

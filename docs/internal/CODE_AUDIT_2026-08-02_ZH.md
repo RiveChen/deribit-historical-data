@@ -5,7 +5,7 @@
 审计范围：`src/deribit_fetcher/`、`scripts/`、`tests/`、构建配置、CI 与核心文档
 审计方式：静态代码审查、现有测试/质量门禁、最小可复现实验；未连接 Deribit 线上 API，也未使用真实 90 GB 数据集做端到端核验。
 
-> **审计后修复状态（2026-08-02）**：本报告识别的三个 P0 已在提交 `8d97623` 修复。P0-1 让活跃 future 的部分尾块以及任何 `has_more=true` 的响应保持 pending；P0-2 以顺序无关的精确位图替代生产路径中的 `max_seen` 过滤，并让 option 游标/checkpoint 显式取整批最大 `trade_seq`；P0-3 改为失败向上抛出、同目录临时文件写入并原子替换。P1-1/P1-2 也已在后续工作树修复：任务队列保持严格有界并为 worker 的单个 follow-up/retry 预留槽位，consumer 失败会被主流程立即监督和传播。完整回归现为 **116 passed**，总覆盖率 **72%**；真实 BTC-PERPETUAL 10000 条样本在串行与 2 进程路径均完成唯一键集合对账。下文保留修复前的发现、复现和验收依据；其余 P1/P2 尚未处理。
+> **审计后修复状态（2026-08-02）**：本报告识别的三个 P0 已在提交 `8d97623` 修复。P0-1 让活跃 future 的部分尾块以及任何 `has_more=true` 的响应保持 pending；P0-2 以顺序无关的精确位图替代生产路径中的 `max_seen` 过滤，并让 option 游标/checkpoint 显式取整批最大 `trade_seq`；P0-3 改为失败向上抛出、同目录临时文件写入并原子替换。P1-1/P1-2 已在提交 `ca523cd` 修复：任务队列保持严格有界并为 worker 的单个 follow-up/retry 预留槽位，consumer 失败会被主流程立即监督和传播。P1-3 已在后续工作树修复：validator 以 SQLite checkpoint 为 inventory 和已知边界，输出 `COMPLETE` / `INCOMPLETE` / `UNKNOWN` 并使用不同退出码。完整回归现为 **124 passed**，总覆盖率 **81%**；真实 BTC-PERPETUAL 10000 条样本在串行与 2 进程路径均完成唯一键集合对账。下文保留修复前的发现、复现和验收依据；P1-4/P1-5 与 P2 尚未处理。
 
 ## 1. 结论
 
@@ -174,6 +174,8 @@
 
 ### P1-3：当前校验不能证明“全量”
 
+> **修复状态：已修复。** validator 现在统计唯一 `trade_seq`，并与对应 SQLite checkpoint 的完整 instrument inventory、已知下界及 completed 状态对账。缺首段、缺已知尾段、缺整个 instrument、重复掩盖缺口均判 `INCOMPLETE`（退出码 1）；覆盖当前已知范围但 checkpoint 尚未完成时判 `UNKNOWN`（退出码 2）；只有最终 checkpoint 精确匹配才判 `COMPLETE`（退出码 0）。future 与 option 两条路径均有回归测试。
+
 `parquet.py:591-636` 只在 Parquet 中已存在的每个 instrument 内比较 `count` 与 `max_seq-min_seq+1`，因此以下情况仍可能显示成功：
 
 - 缺少 1..`min_seq-1`；
@@ -253,7 +255,7 @@
 
 - [x] P0-1、P0-2、P0-3 全部修复并有失败前/修复后的回归测试；
 - [ ] 对 BTC future 与 option 各选一组真实数据，比较 JSONL 与 Parquet 的唯一键集合；
-- [ ] 校验能识别缺首段、缺尾段、缺 instrument 和重复掩盖缺口；
+- [x] 校验能识别缺首段、缺尾段、缺 instrument 和重复掩盖缺口，并区分未知最终边界；
 - [ ] 任一读取/写入/checkpoint 错误导致非零退出，旧产物不被覆盖；
 - [x] 压力测试证明小容量队列不会死锁，consumer 失败会在固定超时内向上冒泡；
 - [ ] CI 强制 test、lint、format，并设置非零覆盖率下限；

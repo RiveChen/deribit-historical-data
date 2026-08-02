@@ -10,9 +10,12 @@ import logging
 import mmap
 import multiprocessing as mp
 import os
+import sqlite3
 import tempfile
 from collections.abc import Generator
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 
 import polars as pl
@@ -589,6 +592,79 @@ def generate_parquet(
 N_BUCKETS = 10
 
 
+class ValidationStatus(Enum):
+    """Proof level produced by Parquet validation."""
+
+    COMPLETE = "COMPLETE"
+    INCOMPLETE = "INCOMPLETE"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class ValidationTarget:
+    """Checkpoint-derived lower bound and completion state for one instrument."""
+
+    max_seq: int
+    is_complete: bool
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    """Machine-readable aggregate returned by :func:`validate_parquet`."""
+
+    complete: int
+    incomplete: int
+    unknown: int
+    total_rows: int
+
+    @property
+    def exit_code(self) -> int:
+        """Return 0 for proven complete, 1 for defects, or 2 for unknown proof."""
+        if self.incomplete:
+            return 1
+        if self.unknown:
+            return 2
+        return 0
+
+
+def _load_validation_targets(checkpoint_path: Path, data_type: str) -> dict[str, ValidationTarget]:
+    """Load instrument inventory and known sequence bounds from a checkpoint DB."""
+    if data_type not in {"future", "option"}:
+        raise ValueError("data_type must be 'future' or 'option'")
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint database not found: {checkpoint_path}")
+
+    with sqlite3.connect(checkpoint_path) as connection:
+        if data_type == "option":
+            rows = connection.execute(
+                "SELECT instrument, last_no, is_completed FROM option_meta"
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT
+                    meta.instrument,
+                    COALESCE(MAX(
+                        CASE
+                            WHEN chunk.is_done = 1 AND chunk.count > 0
+                            THEN chunk.chunk_no + chunk.count - 1
+                            ELSE 0
+                        END
+                    ), 0) AS max_seq,
+                    meta.is_completed
+                FROM future_meta AS meta
+                LEFT JOIN future_chunk AS chunk
+                    ON chunk.instrument = meta.instrument
+                GROUP BY meta.instrument, meta.is_completed
+                """
+            ).fetchall()
+
+    return {
+        instrument: ValidationTarget(max_seq=int(max_seq or 0), is_complete=bool(is_complete))
+        for instrument, max_seq, is_complete in rows
+    }
+
+
 def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
     """For each instrument with gaps, show a per-bucket histogram.
 
@@ -606,6 +682,7 @@ def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
 
         bucket_counts = (
             lf.filter(pl.col("instrument_name") == instr_name)
+            .unique(subset=["trade_seq"])
             .with_columns(
                 (pl.col("trade_seq") - seq_min)
                 .cast(pl.Int64)
@@ -635,11 +712,23 @@ def _show_gap_histogram(lf: pl.LazyFrame, gapped: list) -> None:
             print(f"  {b + 1:>8d}  {b_rows:>10,}  {b_expected:>10,}  {deficit:>+10,}{marker}")
 
 
-def validate_parquet(parquet_path: Path) -> None:
-    """Validate a generated parquet file, checking each instrument for gaps."""
+def validate_parquet(
+    parquet_path: Path,
+    *,
+    checkpoint_path: Path | None = None,
+    data_type: str | None = None,
+) -> ValidationResult:
+    """Validate structure and, when possible, prove completeness from checkpoints."""
     if not parquet_path.exists():
-        logger.warning(f"Parquet file not found: {parquet_path}")
-        return
+        raise FileNotFoundError(f"Parquet file not found: {parquet_path}")
+    if (checkpoint_path is None) != (data_type is None):
+        raise ValueError("checkpoint_path and data_type must be provided together")
+
+    targets = (
+        _load_validation_targets(checkpoint_path, data_type)
+        if checkpoint_path is not None and data_type is not None
+        else None
+    )
 
     print(f"\n{'=' * 80}")
     print(f"Validating Parquet: {parquet_path}")
@@ -658,6 +747,7 @@ def validate_parquet(parquet_path: Path) -> None:
         .agg(
             [
                 pl.len().alias("count"),
+                pl.n_unique("trade_seq").alias("unique_count"),
                 pl.min("trade_seq").alias("seq_min"),
                 pl.max("trade_seq").alias("seq_max"),
                 pl.min("timestamp").alias("ts_min"),
@@ -667,49 +757,90 @@ def validate_parquet(parquet_path: Path) -> None:
         .collect(engine="streaming")
     )
 
-    print(f"\n{'Instrument':35s} {'Rows':>10s} {'Seq Range':>24s} {'Status':20s}")
-    print("-" * 93)
+    print(f"\n{'Instrument':35s} {'Rows':>10s} {'Seq Range':>24s} {'Status':30s}")
+    print("-" * 103)
 
-    total_rows = 0
-    ok_count = 0
-    gap_count = 0
+    total_rows = int(instr_stats["count"].sum() or 0)
+    status_counts = {status: 0 for status in ValidationStatus}
     gapped_instruments = []
-
-    ts_min_global = instr_stats[0, "ts_min"]
-    ts_max_global = instr_stats[0, "ts_max"]
     instr_stats = instr_stats.sort("instrument_name")
+    stats_by_instrument = {row[0]: row[1:] for row in instr_stats.iter_rows()}
+    instrument_names = set(stats_by_instrument)
+    if targets is not None:
+        instrument_names.update(targets)
 
-    for row in instr_stats.iter_rows():
-        instr, count, seq_min, seq_max, ts_min, ts_max = row
-        total_rows += count
-        expected = seq_max - seq_min + 1
+    for instr in sorted(instrument_names):
+        stats = stats_by_instrument.get(instr)
+        target = targets.get(instr) if targets is not None else None
 
-        if ts_min < ts_min_global:
-            ts_min_global = ts_min
-        if ts_max > ts_max_global:
-            ts_max_global = ts_max
-
-        if count < expected:
-            gap = expected - count
-            status = f"⚠️  {gap} gaps"
-            gap_count += 1
-            gapped_instruments.append((instr, count, seq_min, seq_max))
+        if stats is None:
+            count = unique_count = 0
+            seq_min = seq_max = None
         else:
-            status = "✅"
-            ok_count += 1
+            count, unique_count, seq_min, seq_max, _ts_min, _ts_max = stats
 
-        print(f"{instr:35s} {count:>10,} {seq_min:>12,}..{seq_max:<12,} {status:20s}")
+        reasons = []
+        if count != unique_count:
+            reasons.append(f"{count - unique_count} duplicates")
+        if unique_count and unique_count < seq_max - seq_min + 1:
+            reasons.append(f"{seq_max - seq_min + 1 - unique_count} internal gaps")
+            gapped_instruments.append((instr, unique_count, seq_min, seq_max))
+
+        if target is not None and target.max_seq > 0:
+            if seq_min != 1:
+                reasons.append("missing head")
+            if seq_max is None or seq_max < target.max_seq:
+                reasons.append(f"missing known tail through {target.max_seq}")
+            if target.is_complete and seq_max is not None and seq_max > target.max_seq:
+                reasons.append(f"rows beyond final checkpoint {target.max_seq}")
+        elif target is not None and target.max_seq == 0 and count:
+            reasons.append("checkpoint expects no rows")
+
+        if reasons:
+            proof = ValidationStatus.INCOMPLETE
+            detail = "; ".join(dict.fromkeys(reasons))
+        elif target is None:
+            proof = ValidationStatus.UNKNOWN
+            detail = "no checkpoint target"
+        elif not target.is_complete:
+            proof = ValidationStatus.UNKNOWN
+            detail = "checkpoint upper bound is not final"
+        else:
+            proof = ValidationStatus.COMPLETE
+            detail = "checkpoint range matched"
+
+        status_counts[proof] += 1
+        seq_range = "-" if seq_min is None else f"{seq_min:,}..{seq_max:,}"
+        print(f"{instr:35s} {count:>10,} {seq_range:>24s} {proof.value}: {detail}")
 
     if gapped_instruments:
         _show_gap_histogram(lf, gapped_instruments)
 
     size_mb = parquet_path.stat().st_size / (1024 * 1024)
-    t_min = datetime.fromtimestamp(int(ts_min_global) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
-    t_max = datetime.fromtimestamp(int(ts_max_global) / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
 
     print(f"\n{'=' * 80}")
     print(f"Total rows: {total_rows:,}")
-    print(f"Files with gaps: {gap_count}    Files OK: {ok_count}")
-    print(f"Time range: {t_min} ~ {t_max}")
+    print(
+        f"Complete: {status_counts[ValidationStatus.COMPLETE]}    "
+        f"Incomplete: {status_counts[ValidationStatus.INCOMPLETE]}    "
+        f"Unknown: {status_counts[ValidationStatus.UNKNOWN]}"
+    )
+    if instr_stats.height:
+        ts_min_global = instr_stats["ts_min"].min()
+        ts_max_global = instr_stats["ts_max"].max()
+        t_min = datetime.fromtimestamp(int(ts_min_global) / 1000, tz=timezone.utc).strftime(
+            "%Y-%m-%d"
+        )
+        t_max = datetime.fromtimestamp(int(ts_max_global) / 1000, tz=timezone.utc).strftime(
+            "%Y-%m-%d"
+        )
+        print(f"Time range: {t_min} ~ {t_max}")
     print(f"File size: {size_mb:.2f} MB")
     print(f"{'=' * 80}")
+
+    return ValidationResult(
+        complete=status_counts[ValidationStatus.COMPLETE],
+        incomplete=status_counts[ValidationStatus.INCOMPLETE],
+        unknown=status_counts[ValidationStatus.UNKNOWN],
+        total_rows=total_rows,
+    )

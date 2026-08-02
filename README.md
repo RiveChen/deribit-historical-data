@@ -150,7 +150,7 @@ All flags:
 
 ### 4. Validate Data
 
-Streaming Parquet validation — detects per-instrument `trade_seq` gaps and prints a gap-distribution histogram, using streaming-safe aggregations so the full file is never loaded into memory (avoids OOM on a 90 GB `future.parquet`).
+Checkpoint-aware streaming validation compares each instrument's unique `trade_seq` range with `future.db` / `option.db`, so it detects internal gaps, duplicates, missing heads/tails, and entirely missing instruments. It reports `COMPLETE` only for an exact match against a final checkpoint; active or otherwise non-final checkpoints are `UNKNOWN` rather than a false success. Exit codes are `0` complete, `1` incomplete, and `2` unknown. Aggregations remain streaming-safe, so the full Parquet file is not loaded into memory.
 
 ```bash
 # Validate both future and option Parquet files

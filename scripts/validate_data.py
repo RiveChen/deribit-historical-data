@@ -30,14 +30,28 @@ def main() -> None:
     set_base_dir(args.base_dir)
 
     types = ["future", "option"] if args.type == "both" else [args.type]
+    exit_code = 0
 
     for data_type in types:
         if data_type == "future":
             parquet_file = settings.base_dir / "future.parquet"
+            checkpoint_file = settings.future_db_path
         else:
             parquet_file = settings.base_dir / "option.parquet"
+            checkpoint_file = settings.option_db_path
 
-        validate_parquet(parquet_file)
+        result = validate_parquet(
+            parquet_file,
+            checkpoint_path=checkpoint_file,
+            data_type=data_type,
+        )
+        if result.incomplete:
+            exit_code = 1
+        elif result.unknown and exit_code == 0:
+            exit_code = 2
+
+    if exit_code:
+        raise SystemExit(exit_code)
 
 
 if __name__ == "__main__":

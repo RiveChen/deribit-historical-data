@@ -4,6 +4,7 @@ All tests operate on in-memory Polars DataFrames — no I/O, no network.
 """
 
 import os
+import sqlite3
 import tempfile
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from deribit_fetcher.parquet import (
     generate_parquet,
     parallel_read_large_file,
     stream_batches,
+    validate_parquet,
 )
 
 # =============================================================================
@@ -598,3 +600,134 @@ class TestParallelRead:
         # After intra + cross-block dedup, we should have exactly 50 unique seqs
         assert len(all_seqs) == 50, f"Expected 50 unique seqs, got {len(all_seqs)}"
         assert sorted(all_seqs) == list(range(1, 51)), "Should have seq 1..50"
+
+
+class TestCheckpointValidation:
+    """Prove completeness only when Parquet matches a final checkpoint inventory."""
+
+    @staticmethod
+    def _write_parquet(path: Path, rows: list[tuple[str, int]]) -> None:
+        pl.DataFrame(
+            {
+                "instrument_name": [instrument for instrument, _seq in rows],
+                "trade_seq": [seq for _instrument, seq in rows],
+                "timestamp": [1_700_000_000_000] * len(rows),
+            }
+        ).write_parquet(path)
+
+    @staticmethod
+    def _write_option_db(path: Path, rows: list[tuple[str, int, int]]) -> None:
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE option_meta (
+                    instrument TEXT PRIMARY KEY,
+                    last_no INTEGER,
+                    is_expired INTEGER,
+                    is_completed INTEGER
+                )
+                """
+            )
+            connection.executemany(
+                "INSERT INTO option_meta VALUES (?, ?, 1, ?)",
+                rows,
+            )
+
+    def test_complete_checkpoint_range_and_empty_instrument(self, tmp_path):
+        """Final exact ranges and explicitly empty instruments are complete."""
+        parquet_path = tmp_path / "option.parquet"
+        checkpoint_path = tmp_path / "option.db"
+        self._write_parquet(parquet_path, [("BTC-A", 1), ("BTC-A", 2), ("BTC-A", 3)])
+        self._write_option_db(
+            checkpoint_path,
+            [("BTC-A", 3, 1), ("BTC-EMPTY", 0, 1)],
+        )
+
+        result = validate_parquet(
+            parquet_path,
+            checkpoint_path=checkpoint_path,
+            data_type="option",
+        )
+
+        assert result.complete == 2
+        assert result.incomplete == 0
+        assert result.unknown == 0
+        assert result.exit_code == 0
+
+    def test_missing_head_and_whole_instrument_are_incomplete(self, tmp_path):
+        """Checkpoint inventory exposes missing leading rows and files."""
+        parquet_path = tmp_path / "option.parquet"
+        checkpoint_path = tmp_path / "option.db"
+        self._write_parquet(parquet_path, [("BTC-A", 2), ("BTC-A", 3)])
+        self._write_option_db(
+            checkpoint_path,
+            [("BTC-A", 3, 1), ("BTC-MISSING", 2, 1)],
+        )
+
+        result = validate_parquet(
+            parquet_path,
+            checkpoint_path=checkpoint_path,
+            data_type="option",
+        )
+
+        assert result.incomplete == 2
+        assert result.exit_code == 1
+
+    def test_nonfinal_checkpoint_is_unknown_not_complete(self, tmp_path):
+        """An active instrument has no provable final upper bound."""
+        parquet_path = tmp_path / "option.parquet"
+        checkpoint_path = tmp_path / "option.db"
+        self._write_parquet(parquet_path, [("BTC-A", 1), ("BTC-A", 2), ("BTC-A", 3)])
+        self._write_option_db(checkpoint_path, [("BTC-A", 3, 0)])
+
+        result = validate_parquet(
+            parquet_path,
+            checkpoint_path=checkpoint_path,
+            data_type="option",
+        )
+
+        assert result.unknown == 1
+        assert result.exit_code == 2
+
+    def test_duplicates_cannot_mask_an_internal_gap(self, tmp_path):
+        """Unique counts prevent duplicates from cancelling a gap numerically."""
+        parquet_path = tmp_path / "option.parquet"
+        checkpoint_path = tmp_path / "option.db"
+        self._write_parquet(parquet_path, [("BTC-A", 1), ("BTC-A", 1), ("BTC-A", 3)])
+        self._write_option_db(checkpoint_path, [("BTC-A", 3, 1)])
+
+        result = validate_parquet(
+            parquet_path,
+            checkpoint_path=checkpoint_path,
+            data_type="option",
+        )
+
+        assert result.incomplete == 1
+        assert result.exit_code == 1
+
+    def test_future_target_is_derived_from_completed_chunks(self, tmp_path):
+        """Completed future chunks provide a final checkpoint range."""
+        parquet_path = tmp_path / "future.parquet"
+        checkpoint_path = tmp_path / "future.db"
+        self._write_parquet(parquet_path, [("BTC-F", 1), ("BTC-F", 2), ("BTC-F", 3)])
+        with sqlite3.connect(checkpoint_path) as connection:
+            connection.execute(
+                "CREATE TABLE future_meta "
+                "(instrument TEXT PRIMARY KEY, is_expired INTEGER, is_completed INTEGER)"
+            )
+            connection.execute(
+                "CREATE TABLE future_chunk "
+                "(instrument TEXT, chunk_no INTEGER, count INTEGER, has_more INTEGER, "
+                "is_done INTEGER)"
+            )
+            connection.execute("INSERT INTO future_meta VALUES ('BTC-F', 1, 1)")
+            connection.execute("INSERT INTO future_chunk VALUES ('BTC-F', 1, 3, 0, 1)")
+
+        result = validate_parquet(
+            parquet_path,
+            checkpoint_path=checkpoint_path,
+            data_type="future",
+        )
+
+        assert result.complete == 1
+        assert result.exit_code == 0

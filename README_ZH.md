@@ -120,7 +120,7 @@ uv run python scripts/gen_parquet.py --type future --workers 8
 
 ### 4. 数据校验
 
-流式 Parquet 校验 — 按交易对检测 `trade_seq` 间隙并打印间隙分布直方图，使用流式安全聚合，全程不将完整文件加载到内存（避免 90 GB `future.parquet` 的 OOM 问题）。
+基于 checkpoint 的流式 Parquet 校验会把每个交易对的唯一 `trade_seq` 范围与 `future.db` / `option.db` 对账，可识别内部缺口、重复、缺首段、缺尾段和整个交易对缺失。只有与最终 checkpoint 精确一致时才输出 `COMPLETE`；活跃或尚未完成的 checkpoint 输出 `UNKNOWN`，不会伪报成功。退出码分别为：`0` 完整、`1` 不完整、`2` 无法证明。聚合保持流式执行，不会把整个 Parquet 一次载入内存。
 
 ```bash
 # 校验期货和期权的 Parquet 文件

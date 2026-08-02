@@ -90,6 +90,8 @@ uv run python scripts/validate_data.py                 # both kinds
 uv run python scripts/validate_data.py --type future   # future | option | both
 ```
 
+Validation uses the matching SQLite checkpoint as its instrument inventory and sequence target. Exit code `0` means every instrument is proven `COMPLETE`; `1` means a known defect (`INCOMPLETE`); `2` means at least one final upper bound is unavailable (`UNKNOWN`). Active instruments commonly produce `UNKNOWN`, which is intentionally distinct from success.
+
 Prints per-instrument row counts, `trade_seq` ranges, a gap flag, and — for instruments with gaps — a bucketed gap histogram. Streaming aggregations keep memory bounded even on a 90 GB Parquet.
 
 ### 4. Benchmark (optional)

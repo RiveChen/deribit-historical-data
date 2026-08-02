@@ -101,6 +101,6 @@ A chunk is finalized (`is_done=1`) only when the API reports `has_more = 0` and 
 
 ## Data integrity notes
 
-- **Gaps**: `validate_data.py` checks per-instrument `trade_seq` continuity and prints a per-bucket gap histogram. A truly empty instrument won't appear in Parquet at all — it is expected, not a gap.
+- **Completeness proof**: `validate_data.py` compares unique per-instrument `trade_seq` ranges with the SQLite checkpoint inventory. Missing heads/tails, missing instruments, internal gaps, and duplicates are `INCOMPLETE`; a continuous range backed only by a non-final checkpoint is `UNKNOWN`; only an exact final-checkpoint match is `COMPLETE`. A final checkpoint with `last_no = 0` explicitly proves that an absent instrument has no trades.
 - **Duplicates**: expected in JSONL, removed in Parquet. `generate_parquet` reports how many were removed.
 - **Timestamps** are epoch-ms UTC; convert with `datetime.fromtimestamp(ts/1000, tz=timezone.utc)`.

@@ -183,7 +183,7 @@ class TestGetLastTradeSeq:
         assert result == 0
 
     async def test_returns_trade_seq_when_trades_exist(self):
-        """A successful response with trades should return the first trade_seq."""
+        """A successful count=1 response should return its sole trade_seq."""
 
         def handler(request):
             return httpx.Response(200, json={"result": {"trades": [{"trade_seq": 42}]}})

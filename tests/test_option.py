@@ -111,12 +111,10 @@ class TestFetchOptionChunk:
         assert result["next_seq"] == 101, "next_seq should fall back to start_seq + 1"
         assert result["finished"] is True, "Expired with no trades should be finished"
 
-    async def test_next_seq_from_first_trade_seq(self):
-        """next_seq is derived from the first (largest) trade_seq in the chunk."""
-        # Deribit returns trades in reverse chronological order,
-        # so trades[0] has the largest trade_seq.
+    async def test_next_seq_from_max_trade_seq_in_unsorted_response(self):
+        """next_seq must use the maximum trade_seq, not the first response row."""
         client = FakeClient(
-            trades=[{"trade_seq": 100}],
+            trades=[{"trade_seq": 90}, {"trade_seq": 100}, {"trade_seq": 95}],
             has_more=True,
         )
         result = await fetch_option_chunk(
@@ -219,13 +217,16 @@ class TestSyncOptionDb:
     """Test the sync callback that flushes data to disk and updates DB."""
 
     async def test_max_seq_is_taken(self):
-        """When multiple items exist per instrument, the max trade_seq is used."""
+        """The checkpoint uses the max seq across every row of every item."""
         sink = FakeSink()
         repo = FakeRepo()
 
         buffers = {
             "BTC-OPT": [
-                {"data": [{"trade_seq": 50}], "finished": False},
+                {
+                    "data": [{"trade_seq": 50}, {"trade_seq": 125}, {"trade_seq": 80}],
+                    "finished": False,
+                },
                 {"data": [{"trade_seq": 100}], "finished": False},
                 {"data": [{"trade_seq": 75}], "finished": False},
             ],
@@ -233,8 +234,7 @@ class TestSyncOptionDb:
 
         await sync_option_db(buffers, sink=sink, repo=repo)
 
-        # The max from the three items is 100
-        assert repo.last_no_updates == [(100, "BTC-OPT")], "Should use max trade_seq"
+        assert repo.last_no_updates == [(125, "BTC-OPT")], "Should use max trade_seq"
 
     async def test_finished_instrument_marked_complete(self):
         """When an instrument has finished=True, it should be marked complete."""

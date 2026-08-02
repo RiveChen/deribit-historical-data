@@ -10,6 +10,7 @@ import logging
 import mmap
 import multiprocessing as mp
 import os
+import tempfile
 from collections.abc import Generator
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,14 +76,80 @@ def dedup_intra(df: pl.DataFrame) -> tuple[pl.DataFrame, int]:
 
 
 def dedup_cross_batch(df: pl.DataFrame, max_seen: int) -> tuple[pl.DataFrame, int]:
-    """Remove rows with trade_seq <= max_seen.
+    """Remove rows with trade_seq <= max_seen from a proven ascending stream.
 
-    Used for cross-batch dedup when streaming large files where trade_seq
-    is monotonic. Returns (filtered_df, removed_count).
+    This helper is retained for callers that have independently established an
+    ascending-order invariant.  Raw Deribit JSONL does *not* provide that
+    invariant and the production merge path must use ``dedup_exact`` instead.
+    Returns (filtered_df, removed_count).
     """
     before = len(df)
     df = df.filter(pl.col("trade_seq").cast(pl.Int64) > max_seen)
     return df, before - len(df)
+
+
+class SeenTradeSeqs:
+    """Compact exact membership tracker for dense, non-negative trade sequences.
+
+    A Python ``set[int]`` stores a full Python object per sequence and becomes
+    prohibitively expensive for large instruments.  Deribit ``trade_seq``
+    values are dense non-negative integers, so one bit per observed sequence is
+    both exact and substantially smaller.  Unlike a single high-water mark, the
+    bitmap is correct for descending and arbitrarily ordered input.
+    """
+
+    def __init__(self) -> None:
+        """Initialize an empty sequence bitmap."""
+        self._bits = bytearray()
+
+    def add(self, trade_seq: int) -> bool:
+        """Record ``trade_seq`` and return True only when it was not seen before."""
+        if trade_seq < 0:
+            raise ValueError(f"trade_seq must be non-negative, got {trade_seq}")
+
+        byte_index, bit_index = divmod(trade_seq, 8)
+        if byte_index >= len(self._bits):
+            self._bits.extend(b"\x00" * (byte_index + 1 - len(self._bits)))
+
+        mask = 1 << bit_index
+        if self._bits[byte_index] & mask:
+            return False
+
+        self._bits[byte_index] |= mask
+        return True
+
+
+def dedup_exact(
+    df: pl.DataFrame,
+    seen_by_instrument: dict[str, SeenTradeSeqs],
+) -> tuple[pl.DataFrame, int]:
+    """Exactly deduplicate rows regardless of their input order.
+
+    Membership is tracked by ``(instrument_name, trade_seq)``.  The function is
+    safe for ascending, descending, shuffled, and mixed-instrument batches.
+    """
+    if df.is_empty():
+        return df, 0
+
+    keep: list[bool] = []
+    for instrument, trade_seq in zip(
+        df["instrument_name"].to_list(),
+        df["trade_seq"].cast(pl.Int64).to_list(),
+        strict=True,
+    ):
+        if instrument is None or trade_seq is None:
+            raise ValueError("instrument_name and trade_seq must not be null")
+        instrument_key = str(instrument)
+        tracker = seen_by_instrument.get(instrument_key)
+        if tracker is None:
+            tracker = SeenTradeSeqs()
+            seen_by_instrument[instrument_key] = tracker
+        keep.append(tracker.add(int(trade_seq)))
+
+    removed = len(df) - sum(keep)
+    if removed == 0:
+        return df, 0
+    return df.filter(pl.Series("keep", keep)), removed
 
 
 def dedup_cross_file(df: pl.DataFrame, seen_keys: set[int] | None) -> tuple[pl.DataFrame, int]:
@@ -120,8 +187,7 @@ def read_and_dedup_file(
 
         return (f.name, df, intra_dup, instr_name, seq_set)
     except Exception as e:
-        logger.error(f"Error processing {f.name}: {e}")
-        return (f.name, None, 0, None, None)
+        raise RuntimeError(f"Failed to process JSONL file {f}") from e
 
 
 # ---------------------------------------------------------------------------
@@ -190,8 +256,7 @@ def _process_block(args: tuple) -> tuple[int, pl.DataFrame | None, int, str | No
         return (start, df, intra_dup, instr_name)
 
     except Exception as e:
-        logger.error(f"Error processing block [{start}:{end}): {e}")
-        return (start, None, 0, None)
+        raise RuntimeError(f"Failed to process {file_path} block [{start}:{end})") from e
 
 
 def parallel_read_large_file(
@@ -222,26 +287,21 @@ def parallel_read_large_file(
     # Sort by block start offset to restore file order
     results.sort(key=lambda r: r[0])
 
-    # Cross-block dedup as we yield (monotonic seq within file)
-    max_seen = -1
+    # Cross-block dedup must be exact: API responses are descending within a
+    # chunk and concurrently-written future chunks may appear in any order.
+    seen_by_instrument: dict[str, SeenTradeSeqs] = {}
 
     for start_offset, df, intra_dup, instr in results:
         if df is None or df.is_empty():
             continue
 
-        if max_seen >= 0:
-            df, cross_dup = dedup_cross_batch(df, max_seen)
-            if cross_dup:
-                logger.debug(
-                    f"{fname}[block offset={start_offset}]: removed {cross_dup} cross-block dups"
-                )
-            if df.is_empty():
-                continue
-
-        # Track max_seen for next block's dedup
-        batch_max = df.select(pl.col("trade_seq").cast(pl.Int64).max()).item()
-        if batch_max is not None and batch_max > max_seen:
-            max_seen = batch_max
+        df, cross_dup = dedup_exact(df, seen_by_instrument)
+        if cross_dup:
+            logger.debug(
+                f"{fname}[block offset={start_offset}]: removed {cross_dup} cross-block dups"
+            )
+        if df.is_empty():
+            continue
 
         yield (fname, df, intra_dup, instr, start_offset)
 
@@ -340,13 +400,13 @@ def generate_parquet(
     mmap-based streaming path is used.
     """
     if not data_dir.exists():
-        logger.error(f"Data directory not found: {data_dir}")
-        return
+        raise FileNotFoundError(f"Data directory not found: {data_dir}")
+    if not data_dir.is_dir():
+        raise NotADirectoryError(f"Data path is not a directory: {data_dir}")
 
-    all_files = list(data_dir.glob("*.jsonl"))
+    all_files = sorted(data_dir.glob("*.jsonl"))
     if not all_files:
-        logger.warning(f"No JSONL files found in {data_dir}")
-        return
+        raise ValueError(f"No JSONL files found in {data_dir}")
 
     large_files = [f for f in all_files if f.stat().st_size >= large_file_threshold]
     small_files = [f for f in all_files if f.stat().st_size < large_file_threshold]
@@ -367,16 +427,22 @@ def generate_parquet(
     logger.info(f"Merging into {output_file}... (compression={compression})")
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_fd, temp_name = tempfile.mkstemp(
+        dir=output_file.parent,
+        prefix=f".{output_file.name}.",
+        suffix=".tmp",
+    )
+    os.close(temp_fd)
+    temp_output = Path(temp_name)
+    writer: pq.ParquetWriter | None = None
 
     try:
         from tqdm import tqdm
 
-        writer: pq.ParquetWriter | None = None
         total_rows = 0
         total_duplicates = 0
 
-        max_seqs: dict[str, int] = {}
-        prev_keys: dict[str, set[int]] = {}
+        seen_by_instrument: dict[str, SeenTradeSeqs] = {}
 
         pending: list[pa.Table] = []
         processed_count = 0
@@ -393,7 +459,7 @@ def generate_parquet(
         def _init_writer(table: pa.Table) -> None:
             nonlocal writer
             if writer is None:
-                writer = pq.ParquetWriter(output_file, table.schema, compression=compression)
+                writer = pq.ParquetWriter(temp_output, table.schema, compression=compression)
 
         # Phase 1 - large files (parallel or streaming)
         if large_files:
@@ -410,28 +476,20 @@ def generate_parquet(
                         total=file_size, unit="B", unit_scale=True, desc=f.name, leave=False
                     ) as inner_pbar:
                         last_pos = 0
-                        for fname, df, intra, instr, pos in iterable:
+                        for fname, df, intra, _instr, pos in iterable:
                             total_duplicates += intra
                             if df.is_empty():
                                 inner_pbar.update(pos - last_pos)
                                 last_pos = pos
                                 continue
 
-                            if dedup and instr is not None:
-                                max_seen = max_seqs.get(instr, -1)
-                                if max_seen >= 0:
-                                    df, cross_dup = dedup_cross_batch(df, max_seen)
-                                    if cross_dup:
-                                        logger.debug(
-                                            f"{fname}: removed {cross_dup} "
-                                            f"cross-batch dups (max={max_seen})"
-                                        )
-                                    total_duplicates += cross_dup
-                                batch_max = df.select(
-                                    pl.col("trade_seq").cast(pl.Int64).max()
-                                ).item()
-                                if batch_max is not None and batch_max > max_seen:
-                                    max_seqs[instr] = batch_max
+                            if dedup:
+                                df, cross_dup = dedup_exact(df, seen_by_instrument)
+                                if cross_dup:
+                                    logger.debug(
+                                        f"{fname}: removed {cross_dup} exact cross-batch dups"
+                                    )
+                                total_duplicates += cross_dup
 
                             total_rows += len(df)
                             if df.is_empty():
@@ -470,16 +528,11 @@ def generate_parquet(
                 if df is None or df.is_empty():
                     return
 
-                if dedup and instr_name is not None and seq_set is not None:
-                    df, cross_dup = dedup_cross_file(df, prev_keys.get(instr_name))
+                if dedup:
+                    df, cross_dup = dedup_exact(df, seen_by_instrument)
                     if cross_dup:
                         logger.debug(f"{fname}: removed {cross_dup} cross-file dups")
                     total_duplicates += cross_dup
-
-                    if instr_name in prev_keys:
-                        prev_keys[instr_name].update(seq_set)
-                    else:
-                        prev_keys[instr_name] = seq_set
 
                 total_rows += len(df)
                 if df.is_empty():
@@ -500,9 +553,13 @@ def generate_parquet(
                         processed_count += 1
                         pbar.update(1)
 
-        if writer is not None:
-            _flush_pending()
-            writer.close()
+        if writer is None:
+            raise ValueError(f"No trade rows found in {data_dir}")
+
+        _flush_pending()
+        writer.close()
+        writer = None
+        os.replace(temp_output, output_file)
 
         summary = f"Successfully loaded {total_rows} rows from {processed_count} files"
         if total_duplicates > 0:
@@ -515,6 +572,14 @@ def generate_parquet(
 
     except Exception:
         logger.exception("Failed to generate parquet")
+        raise
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                logger.exception("Failed to close partial Parquet writer")
+        temp_output.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

@@ -135,7 +135,7 @@ uv run python scripts/gen_parquet.py --type future --workers 8
 The generator uses a two-phase strategy:
 
 - **Small files** (`< --large-threshold-mb`, default 100 MB; typical options): read in parallel with a thread pool (`--workers`), one file per worker, deduped per file.
-- **Large files** (`>= --large-threshold-mb`; typical perpetuals): stream-read in the main thread in fixed-size batches (`--stream-batch-size` rows, default 200000) using `mmap` for zero-copy line splitting. Because `trade_seq` is monotonic within a file, cross-batch dedup is a simple `trade_seq > max_seen` filter, so memory stays bounded regardless of file size (no OOM on 90 GB perpetual files).
+- **Large files** (`>= --large-threshold-mb`; typical perpetuals): stream-read in the main thread in fixed-size batches (`--stream-batch-size` rows, default 200000) using `mmap` for zero-copy line splitting. Cross-batch dedup uses an exact per-instrument bitmap (one bit per sequence position), so descending API responses and concurrently appended out-of-order chunks are handled correctly without a Python object per trade.
 
 All flags:
 

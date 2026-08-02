@@ -59,11 +59,12 @@ Short ADR-style records: **context → options → decision → consequences**. 
 
 ---
 
-## 7. Size-tiered Parquet merge; monotonic cross-batch dedup
+## 7. Size-tiered Parquet merge; order-independent exact dedup
 
 **Context.** Option files are many and small; a perpetual future file can be tens of GB — too big to load at once.
-**Decision.** Small files → thread pool (one file per worker). Large files → streaming in row batches (`mmap`) or a **process pool** over `\n`-aligned byte blocks (`--stream-workers`). Because `trade_seq` is monotonic *within a file*, cross-batch dedup is a single `trade_seq > max_seen` filter instead of a growing `set`.
-**Consequences.** Bounded memory regardless of file size (no OOM on 90 GB). Small-file dedup still uses a per-instrument `set` across files. The parallel path must reconcile block order; correctness is pinned by tests asserting identical output to the single-thread path.
+**Decision.** Small files → thread pool (one file per worker). Large files → streaming in row batches (`mmap`) or a **process pool** over `\n`-aligned byte blocks (`--stream-workers`). Cross-batch and cross-file dedup use an exact bitmap keyed by `(instrument_name, trade_seq)`, consuming one bit per sequence position instead of one Python object per trade.
+**Why not a high-water mark.** API responses are broadly descending but their default order is not guaranteed, and concurrently completed future chunks are appended in completion order. Therefore the JSONL file is not guaranteed to be ascending; filtering on `trade_seq > max_seen` can delete unique rows.
+**Consequences.** Dedup is correct for ascending, descending, and shuffled chunks. Bitmap memory grows with the largest sequence span for each instrument. The parallel reader still has separate memory-scaling work tracked as technical debt.
 
 ---
 

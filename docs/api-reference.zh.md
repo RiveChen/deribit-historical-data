@@ -102,7 +102,7 @@ GET /get_last_trades_by_instrument
 
 | 模式 | 使用方式 | 返回数据 | 典型场景 |
 |------|---------|---------|---------|
-| **范围查询** | 同时传 `start_seq` + `end_seq` + `count` | 返回该范围内符合 `count` 限制的成交（从 start_seq 开始降序） | 按 seq 分块抓取全部历史 |
+| **范围查询** | 同时传 `start_seq` + `end_seq` + `count` | 返回该范围内符合 `count` 限制的成交；默认行顺序不保证 | 按 seq 分块抓取全部历史 |
 | **游标查询** | 只传 `count`，不传 `start_seq`/`end_seq` | 返回最新的 `count` 条成交 | 获取最新成交 seq |
 
 #### 代码调用方式
@@ -126,17 +126,17 @@ params = {
 
 ### `count` 参数
 
-- **有效范围**: 1 ~ 10,000
+- **history host 实测范围**：1 ~ 10,000（2026-08-02 接受 `count=10,000`）
 - **当 count < 范围内实际数据量**：返回 count 条，`has_more = true`
 - **当 count >= 范围内实际数据量**：返回全部，`has_more = false`
-- **注意**：Deribit 文档声称 count 上限是 10,000，但实测 count=10,000 配合 start/end_seq 时，即使范围内实际数量 <=10,000，`has_more` 仍为 false（见 has_more 语义一节）
+- **注意**：当前 Deribit 通用 API 文档写明上限为 1,000，但 `history.deribit.com` 在 2026-08-02 production 探针中接受并返回了 10,000 行。应把它视为 history host 的兼容性契约并持续监控漂移。
 
 ### `start_seq` 和 `end_seq` 参数
 
 - **`start_seq`**：包含此 seq 及以上的成交（起始 seq）
 - **`end_seq`**：包含此 seq 及以下的成交（结束 seq）
-- **trade_seq 降序返回**：最新的（highest seq）在前，最旧的（lowest seq）在后
-- **范围并非排他**：`[start_seq, end_seq]` 闭区间，包含边界值
+- **默认返回顺序不保证**：必须显式计算 min/max，不能用第一行推导游标
+- **按闭区间请求**：`[start_seq, end_seq]`；history host 偶尔会返回边界重叠，因此最终以 `has_more` 与精确键校验为准
 
 ---
 
@@ -193,7 +193,7 @@ params = {
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `result.trades` | array\[Trade\] | 成交数据数组，**降序排列**（highest seq first） |
+| `result.trades` | array\[Trade\] | 成交数据数组；默认顺序可能包含局部逆序 |
 | `result.has_more` | boolean | **范围内是否有更多数据**（非"是否有后续范围"） |
 
 ### 4.3 Trade 结构（全部字段 Union）
@@ -247,13 +247,13 @@ params = {
 **对代码的影响**：
 
 - **Future.py**：使用 `start_seq` ~ `end_seq` 预分配所有 chunk。因为 CHUNK_SIZE == count 且范围精确 = CHUNK_SIZE，正常情况下 `has_more` 应为 false。只要每个 chunk 的 seq 区间不重叠（`[1,10000], [10001,20000]`...），不会漏数据。✅
-- **Option.py**：使用 `next_seq = trades[0].trade_seq + 1` 流式推进，每次请求 count=CHUNK_SIZE。因为 `count` 始终 == `end_seq - start_seq + 1`，所以 `has_more` 在非边界时总是 false。✅
+- **Option.py**：使用 `next_seq = max(trade_seq) + 1` 流式推进，不依赖响应顺序。满响应或 `has_more=true` 时继续调度。✅
 
 ### 5.2 `trade_seq` 的排序机制
 
 - **单调递增**：新成交的 `trade_seq` 总是大于旧成交
-- **降序返回**：每次请求返回的 trades 数组从 high seq 到 low seq 排列
-- **每次返回的 first trade_seq 即为本次范围内最高 seq**
+- **默认返回顺序未指定**：真实 history 响应整体偏降序，但存在局部逆序
+- **游标规则**：必须取所有返回行的最大 `trade_seq`，不能使用 `trades[0]`
 
 ### 5.3 Chunk 边界连续性
 
@@ -274,7 +274,7 @@ BTC-27MAR26:
 
 - `count` 参数是 **per-request 的返回条数上限**，不是总条数
 - 当 `count` 设为 CHUNK_SIZE，且 `end_seq - start_seq + 1` 也等于 CHUNK_SIZE 时，`has_more` 由范围内实际数据量决定
-- **当范围内实际数据 < count**：返回全部数据，`has_more=false`（这就是 finalize 条件 `count >= CHUNK_SIZE OR has_more=0` 正确的原因）
+- **当范围内实际数据 < count**：返回当前全部数据，`has_more=false`。只有已过期 instrument 的该 chunk 才能 finalize；活跃 future 的尾块仍可能在后续增长，因此保持 pending。
 
 ---
 
@@ -351,9 +351,10 @@ trades, has_more = await client.get_trades_chunk(instrument, start_seq, end_seq)
 UPDATE future_chunk 
 SET is_done = 1 
 WHERE is_done = 0 
-AND (count >= ? OR has_more = 0)
--- count ≥ CHUNK_SIZE → 说明该 chunk 已取满
--- has_more = 0 → 说明范围内已无剩余数据（last chunk）
+AND has_more = 0
+AND (count >= ? OR instrument_is_expired)
+-- has_more = 0 且 count ≥ CHUNK_SIZE → 固定范围完整
+-- has_more = 0 且已过期 → 最终尾块不再增长
 ```
 
 ### 7.2 Option Fetch Strategy
@@ -370,7 +371,7 @@ AND (count >= ? OR has_more = 0)
 **流式推进逻辑**（option.py:89-101）：
 
 ```python
-last_seq_in_chunk = trades[0]["trade_seq"]  # 本 chunk 最高 seq
+last_seq_in_chunk = max(trade["trade_seq"] for trade in trades)
 next_seq = last_seq_in_chunk + 1            # 下一个 chunk 的起始 seq
 should_continue = has_more or len(trades) >= CHUNK_SIZE  # 是否还有更多
 ```
@@ -387,18 +388,18 @@ WHERE instrument = ?
 
 ## 8. 已验证的假设
 
-以下假设通过真实端点测试（2025-05-18）验证：
+以下结论综合了 2025-05-18 的原始端点测试与 2026-08-02 的 production history 复验：
 
 | # | 假设 | 结论 |
 |---|------|------|
 | 1 | 响应结构为 `{ result: { trades: [...], has_more: bool } }` | ✅ 确认 |
 | 2 | trade_seq 单调递增，新 > 旧 | ✅ 确认 |
-| 3 | 每次返回降序排列（high seq first） | ✅ 确认 |
+| 3 | 默认响应严格降序（high seq first） | ❌ 已推翻；实测存在局部逆序 |
 | 4 | Future 和 Option 的 Trade 结构一致 | ✅ 确认（10/10 字段） |
 | 5 | `has_more` 表示范围内是否还有数据 | ✅ 确认，与 count 限制相关 |
-| 6 | count=CHUNK_SIZE 且范围精确时 has_more=false | ✅ 确认 |
-| 7 | `next_seq = first_trade_seq + 1` 可继续抓取 | ✅ 确认 |
-| 8 | 最后 chunk 满足 `count<CHUNK_SIZE AND has_more=0` → 可 finalize | ✅ 确认 |
+| 6 | count=CHUNK_SIZE 且范围精确时 has_more=false | 通常成立；否则保持 pending |
+| 7 | `next_seq = max(trade_seq) + 1` 可继续抓取 | ✅ 确认 |
+| 8 | 已过期的最后 chunk 满足 `count<CHUNK_SIZE AND has_more=0` → 可 finalize | ✅ 确认 |
 | 9 | `start_seq=1` 开始能覆盖全量历史 | ✅ 确认 |
 | 10 | Chunk 边界基本 disjoint（偶有 1 条重叠） | ✅ 确认 |
 

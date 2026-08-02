@@ -86,7 +86,7 @@ Created by `DatabaseClient` on first connect, with `PRAGMA journal_mode=WAL` and
 | `has_more` | INTEGER | API `has_more` for the chunk |
 | `is_done` | INTEGER | 1 once finalized |
 
-A chunk is finalized (`is_done=1`) when `count >= CHUNK_SIZE OR has_more = 0`. An expired future is marked complete once all its chunks are done.
+A chunk is finalized (`is_done=1`) only when the API reports `has_more = 0` and either `count >= CHUNK_SIZE` or the future is expired. A full-sized response with `has_more = 1` remains pending because the server explicitly reports additional rows in the range. An active future's partial tail also remains pending because new trades can grow into the same fixed range; re-fetching may append duplicates, which the Parquet stage removes exactly. An expired future is marked complete once all its chunks are done.
 
 ### `option_meta` — per-instrument option state + resume offset
 

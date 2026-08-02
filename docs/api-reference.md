@@ -102,7 +102,7 @@ GET /get_last_trades_by_instrument
 
 | Mode | Usage | Returns | Typical Use Case |
 |------|-------|---------|-----------------|
-| **Range Query** | `start_seq` + `end_seq` + `count` | Trades within the range, limited by `count` (sorted descending from start_seq) | Chunked full history download |
+| **Range Query** | `start_seq` + `end_seq` + `count` | Trades within the range, limited by `count`; default row order is not guaranteed | Chunked full history download |
 | **Cursor Query** | `count` only, no `start_seq`/`end_seq` | The most recent `count` trades | Getting the latest trade seq |
 
 #### Code Usage
@@ -126,17 +126,17 @@ params = {
 
 ### `count` Parameter
 
-- **Valid range**: 1 ~ 10,000
+- **Observed history-host range**: 1 ~ 10,000 (`count=10,000` accepted on 2026-08-02)
 - **When count < actual data in range**: returns `count` trades, `has_more = true`
 - **When count >= actual data in range**: returns all trades, `has_more = false`
-- **Note**: Deribit docs state the count limit is 10,000. Real-world testing shows that when count=10,000 and start/end_seq are used, even when the actual data within the range is <=10,000, `has_more` is still false (see has_more semantics section).
+- **Note**: The current generic Deribit API reference states a 1,000 maximum, while `history.deribit.com` accepted and returned 10,000 rows in the 2026-08-02 production probe. Treat this as a history-host compatibility contract and monitor it for drift.
 
 ### `start_seq` and `end_seq` Parameters
 
 - **`start_seq`**: Inclusive lower bound
 - **`end_seq`**: Inclusive upper bound
-- **Results sorted descending**: newest (highest seq) first, oldest (lowest seq) last
-- **Closed interval**: `[start_seq, end_seq]`, boundary values included
+- **Default result order is not guaranteed**: explicitly compute min/max; do not infer a cursor from the first row
+- **Requested as a closed interval**: `[start_seq, end_seq]`; the history host can occasionally return a boundary overlap, so `has_more` and exact key validation remain authoritative
 
 ---
 
@@ -193,7 +193,7 @@ params = {
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `result.trades` | array\[Trade\] | Array of trades, **sorted descending** (highest seq first) |
+| `result.trades` | array\[Trade\] | Array of trades; default ordering may contain local inversions |
 | `result.has_more` | boolean | **Whether there is more data within the requested range** (not "whether there is more data beyond the range") |
 
 ### 4.3 Trade Structure (Full Field Union)
@@ -247,13 +247,13 @@ Using `BTC-26JUN26` (last_seq = 1,912,937) as an example:
 **Impact on Code**:
 
 - **Future.py**: Uses `start_seq` ~ `end_seq` to pre-allocate all chunks. Since CHUNK_SIZE == count and the range exactly equals CHUNK_SIZE, `has_more` is normally false. As long as chunk seq intervals don't overlap (`[1,10000], [10001,20000]`...), no data is missed. ✅
-- **Option.py**: Uses `next_seq = trades[0].trade_seq + 1` to advance, requesting count=CHUNK_SIZE each time. Since `count` always equals `end_seq - start_seq + 1`, `has_more` is always false at non-boundary positions. ✅
+- **Option.py**: Uses `next_seq = max(trade_seq) + 1` to advance, independent of response ordering. A full response or `has_more=true` schedules another range. ✅
 
 ### 5.2 `trade_seq` Ordering
 
 - **Monotonically increasing**: New trades always have a larger `trade_seq` than older trades
-- **Descending response**: The returned trades array is sorted from high seq to low seq
-- **The first trade_seq in each response is the highest seq within the requested range**
+- **Response order is unspecified by default**: real history responses are broadly descending but contain local inversions
+- **Cursor rule**: use the maximum `trade_seq` across all returned rows, never `trades[0]`
 
 ### 5.3 Chunk Boundary Continuity
 
@@ -274,7 +274,7 @@ BTC-27MAR26:
 
 - The `count` parameter is a **per-request upper limit**, not a total count
 - When `count` is set to CHUNK_SIZE, and `end_seq - start_seq + 1` is also CHUNK_SIZE, `has_more` is determined by the actual amount of data within the range
-- **When actual data < count**: returns all data, `has_more=false` (this is why the finalize condition `count >= CHUNK_SIZE OR has_more=0` is correct)
+- **When actual data < count**: returns all current data, `has_more=false`. The chunk is final only if the instrument is expired; an active future's partial tail remains pending because the same range can grow later.
 
 ---
 
@@ -351,9 +351,10 @@ trades, has_more = await client.get_trades_chunk(instrument, start_seq, end_seq)
 UPDATE future_chunk 
 SET is_done = 1 
 WHERE is_done = 0 
-AND (count >= ? OR has_more = 0)
--- count >= CHUNK_SIZE → chunk has been fully fetched
--- has_more = 0 → no more data remaining in range (last chunk)
+AND has_more = 0
+AND (count >= ? OR instrument_is_expired)
+-- has_more = 0 + count >= CHUNK_SIZE → fixed range is complete
+-- has_more = 0 + expired → final partial range can no longer grow
 ```
 
 ### 7.2 Option Fetch Strategy
@@ -370,7 +371,7 @@ Steps:
 **Streaming Advance** (option.py:89-101):
 
 ```python
-last_seq_in_chunk = trades[0]["trade_seq"]  # highest seq in this chunk
+last_seq_in_chunk = max(trade["trade_seq"] for trade in trades)
 next_seq = last_seq_in_chunk + 1            # start seq for next chunk
 should_continue = has_more or len(trades) >= CHUNK_SIZE  # more data available?
 ```
@@ -387,18 +388,18 @@ WHERE instrument = ?
 
 ## 8. Verified Assumptions
 
-The following assumptions have been verified through real endpoint testing (2025-05-18):
+The following assumptions combine the original 2025-05-18 endpoint test with a production-history recheck on 2026-08-02:
 
 | # | Assumption | Result |
 |---|-----------|--------|
 | 1 | Response structure is `{ result: { trades: [...], has_more: bool } }` | ✅ Confirmed |
 | 2 | trade_seq is monotonically increasing (new > old) | ✅ Confirmed |
-| 3 | Results are sorted descending (high seq first) | ✅ Confirmed |
+| 3 | Default results are strictly descending | ❌ Refuted; local inversions observed |
 | 4 | Future and Option trades share the same structure | ✅ Confirmed (10/10 fields) |
 | 5 | `has_more` indicates whether more data exists within the range | ✅ Confirmed, tied to count limit |
-| 6 | count=CHUNK_SIZE with exact range → has_more=false | ✅ Confirmed |
-| 7 | `next_seq = first_trade_seq + 1` can continue fetching | ✅ Confirmed |
-| 8 | Last chunk satisfies `count<CHUNK_SIZE AND has_more=0` → finalizable | ✅ Confirmed |
+| 6 | count=CHUNK_SIZE with exact range → has_more=false | Normally true; if false, keep pending |
+| 7 | `next_seq = max(trade_seq) + 1` can continue fetching | ✅ Confirmed |
+| 8 | Expired last chunk satisfies `count<CHUNK_SIZE AND has_more=0` → finalizable | ✅ Confirmed |
 | 9 | Starting from `start_seq=1` covers full history | ✅ Confirmed |
 | 10 | Chunk boundaries are mostly disjoint (occasional 1-trade overlap) | ✅ Confirmed |
 

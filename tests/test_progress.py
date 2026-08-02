@@ -36,12 +36,12 @@ pytestmark = pytest.mark.asyncio
 class TestFutureProgressRepo:
     """Tests for FutureProgressRepo finalize/resume logic."""
 
-    async def test_finalize_chunks_marks_done(self, future_repo):
-        """A chunk with count=10000 should be marked is_done=1 by finalize_chunks."""
+    async def test_finalize_chunks_marks_confirmed_full_range_done(self, future_repo):
+        """A full response is final only when the API also reports has_more=false."""
         # Insert a "complete" chunk with count >= CHUNK_SIZE
         await future_repo.db.execute(
             "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",  # noqa: E501
-            ("BTC-PERPETUAL", 1, 10000, 1),
+            ("BTC-PERPETUAL", 1, 10000, 0),
         )
         await future_repo.db.commit()
 
@@ -53,6 +53,19 @@ class TestFutureProgressRepo:
         )
         row = await cur.fetchone()
         assert row["is_done"] == 1, "Completed chunk should be marked done"
+
+    async def test_finalize_chunks_keeps_full_response_with_more_pending(self, future_repo):
+        """count=CHUNK_SIZE cannot override an explicit has_more=true response."""
+        await future_repo.db.execute(
+            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",  # noqa: E501
+            ("BTC-PERPETUAL", 1, 10_000, 1),
+        )
+        await future_repo.db.commit()
+
+        await future_repo.finalize_chunks()
+
+        pending = await future_repo.get_pending_chunks()
+        assert pending == [{"instrument": "BTC-PERPETUAL", "chunk_no": 1}]
 
     async def test_finalize_chunks_skips_partial(self, future_repo):
         """A chunk with count < CHUNK_SIZE and has_more=1 should NOT be marked done."""
@@ -71,11 +84,15 @@ class TestFutureProgressRepo:
         row = await cur.fetchone()
         assert row["is_done"] == 0, "Partial chunk should NOT be marked done"
 
-    async def test_finalize_chunks_marks_no_more(self, future_repo):
-        """A chunk with has_more=0 (last chunk) should be marked done regardless of count."""
+    async def test_finalize_chunks_marks_expired_partial_tail_done(self, future_repo):
+        """An expired future's partial tail cannot grow and should be finalized."""
+        await future_repo.db.execute(
+            "INSERT INTO future_meta (instrument, is_expired, is_completed) VALUES (?, 1, 0)",
+            ("BTC-EXPIRED",),
+        )
         await future_repo.db.execute(
             "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",  # noqa: E501
-            ("BTC-PERPETUAL", 5, 350, 0),
+            ("BTC-EXPIRED", 5, 350, 0),
         )
         await future_repo.db.commit()
 
@@ -83,10 +100,50 @@ class TestFutureProgressRepo:
 
         cur = await future_repo.db.execute(
             "SELECT is_done FROM future_chunk WHERE instrument=? AND chunk_no=?",
-            ("BTC-PERPETUAL", 5),
+            ("BTC-EXPIRED", 5),
         )
         row = await cur.fetchone()
-        assert row["is_done"] == 1, "Final chunk (has_more=0) should be marked done"
+        assert row["is_done"] == 1, "Expired partial tail should be marked done"
+
+    async def test_finalize_chunks_keeps_active_partial_tail_pending(self, future_repo):
+        """An active future can grow inside its current tail chunk on the next run."""
+        await future_repo.db.execute(
+            "INSERT INTO future_meta (instrument, is_expired, is_completed) VALUES (?, 0, 0)",
+            ("BTC-PERPETUAL",),
+        )
+        await future_repo.db.execute(
+            "INSERT INTO future_chunk (instrument, chunk_no, count, has_more, is_done) VALUES (?, ?, ?, ?, 0)",  # noqa: E501
+            ("BTC-PERPETUAL", 10_001, 5_000, 0),
+        )
+        await future_repo.db.commit()
+
+        await future_repo.finalize_chunks()
+
+        pending = await future_repo.get_pending_chunks()
+        assert pending == [{"instrument": "BTC-PERPETUAL", "chunk_no": 10_001}]
+
+    async def test_active_tail_is_reopened_until_fixed_range_is_full(self, future_repo):
+        """Growth from seq 15000 to 25000 must schedule the 15001..20000 interval."""
+        instrument = "BTC-PERPETUAL"
+        await future_repo.db.execute(
+            "INSERT INTO future_meta (instrument, is_expired, is_completed) VALUES (?, 0, 0)",
+            (instrument,),
+        )
+        await future_repo.upsert_chunks([(instrument, 1), (instrument, 10_001)])
+        await future_repo.update_chunks(
+            [
+                (10_000, False, instrument, 1),
+                (5_000, False, instrument, 10_001),
+            ]
+        )
+        await future_repo.finalize_chunks()
+
+        await future_repo.upsert_chunks(
+            [(instrument, 1), (instrument, 10_001), (instrument, 20_001)]
+        )
+
+        pending = await future_repo.get_pending_chunks()
+        assert {chunk["chunk_no"] for chunk in pending} == {10_001, 20_001}
 
     async def test_get_pending_chunks_excludes_done(self, future_repo):
         """get_pending_chunks should only return is_done=0 chunks."""

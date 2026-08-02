@@ -105,7 +105,7 @@ uv run python scripts/gen_parquet.py --type future --workers 8
 
 生成器采用两阶段策略：
 - **小文件**（`< --large-threshold-mb`，默认 100 MB，典型期权）：用线程池（`--workers`）并行读取，一个文件一个 worker，逐文件去重。
-- **大文件**（`>= --large-threshold-mb`，典型永续合约）：在主线程中按固定大小分批流式读取（`--stream-batch-size` 行，默认 200000），用 `mmap` 做零拷贝换行切分。由于单个文件内 `trade_seq` 单调递增，跨批去重只需 `trade_seq > max_seen` 过滤，因此无论文件多大内存都保持有界（90 GB 永续文件也不会 OOM）。
+- **大文件**（`>= --large-threshold-mb`，典型永续合约）：在主线程中按固定大小分批流式读取（`--stream-batch-size` 行，默认 200000），用 `mmap` 做零拷贝换行切分。跨批去重使用按 instrument 隔离的精确位图（每个序号位置 1 bit），因此可以正确处理 API 降序响应以及并发追加造成的乱序 chunk，同时避免为每笔成交保留一个 Python 对象。
 
 全部参数：
 

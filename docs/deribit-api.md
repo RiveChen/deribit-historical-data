@@ -25,11 +25,11 @@ Developer-facing summary of the Deribit **history** API as this project uses it.
 
 ### 1. `has_more` means "more **within the requested range**"
 
-Not "more data beyond `start_seq`". With a range `[start_seq, end_seq]` of exactly `CHUNK_SIZE` and `count = CHUNK_SIZE`, `has_more` is normally `false` even though older data exists outside the range. Both fetch strategies rely on exact range partitioning / `next_seq` advancement rather than on `has_more` to decide when to stop — so this quirk doesn't cause missed data. It *does* inform the future chunk finalize rule: `count >= CHUNK_SIZE OR has_more = 0`.
+Not "more data beyond `start_seq`". With a range `[start_seq, end_seq]` of exactly `CHUNK_SIZE` and `count = CHUNK_SIZE`, `has_more` is normally `false` even though older data exists outside the range. A future chunk is final only when `has_more = 0` and either the response fills the fixed range or the instrument has expired. A full-sized response with `has_more = 1` remains pending because the server explicitly reports more rows in the range. An active future's partial tail also remains pending and is safely re-fetched as it grows.
 
 ### 2. Trades come back **descending**; `trade_seq` is monotonic
 
-`result.trades` is sorted highest-seq first, so `trades[0]["trade_seq"]` is the top of the returned range. Options advance with `next_seq = trades[0].trade_seq + 1`. The within-file monotonicity is exactly what lets the Parquet merge dedup large files with a single `trade_seq > max_seen` filter (see [design-decisions.md](./design-decisions.md#7-size-tiered-parquet-merge-monotonic-cross-batch-dedup)).
+`trade_seq` itself increases over time, but the endpoint's default response order is not guaranteed. Production history responses are broadly descending yet contain local inversions. Options therefore advance with `next_seq = max(trade["trade_seq"] for trade in trades) + 1`, and checkpoint updates use the same explicit maximum. The Parquet merge uses exact bitmap membership rather than any row-order assumption (see [design-decisions.md](./design-decisions.md#7-size-tiered-parquet-merge-order-independent-exact-dedup)).
 
 ### 3. Occasional 1-trade chunk-boundary overlap
 

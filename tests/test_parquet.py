@@ -11,10 +11,13 @@ import polars as pl
 import pytest
 
 from deribit_fetcher.parquet import (
+    SeenTradeSeqs,
     _split_blocks,
     dedup_cross_batch,
     dedup_cross_file,
+    dedup_exact,
     dedup_intra,
+    generate_parquet,
     parallel_read_large_file,
     stream_batches,
 )
@@ -137,7 +140,7 @@ class TestDedupIntra:
 
 
 class TestDedupCrossBatch:
-    """Remove rows where trade_seq <= max_seen (boundary is critical)."""
+    """Legacy high-water helper for streams proven to be ascending."""
 
     def test_removes_leq_max_seen(self):
         """trade_seq <= 5 should be removed; trade_seq > 5 should survive."""
@@ -173,6 +176,119 @@ class TestDedupCrossBatch:
         result, removed = dedup_cross_batch(df, max_seen=5)
         assert result.is_empty()
         assert removed == 0
+
+
+class TestExactDedup:
+    """Exact bitmap dedup must not depend on row or batch ordering."""
+
+    def test_seen_trade_sequences_tracks_sparse_arrival_order(self):
+        """A sequence is new exactly once even when values arrive out of order."""
+        seen = SeenTradeSeqs()
+        assert [seen.add(seq) for seq in [100, 1, 50, 100, 1]] == [True, True, True, False, False]
+
+    def test_descending_batches_keep_all_unique_rows(self):
+        """Descending API order must not be mistaken for old duplicate data."""
+        seen: dict[str, SeenTradeSeqs] = {}
+
+        first, first_removed = dedup_exact(_df([5, 4]), seen)
+        second, second_removed = dedup_exact(_df([3, 2, 1]), seen)
+
+        assert first["trade_seq"].to_list() == [5, 4]
+        assert second["trade_seq"].to_list() == [3, 2, 1]
+        assert first_removed == second_removed == 0
+
+    def test_shuffled_cross_batch_duplicates_are_removed_exactly(self):
+        """Only actual duplicate keys should be removed from shuffled batches."""
+        seen: dict[str, SeenTradeSeqs] = {}
+
+        first, _ = dedup_exact(_df([10, 3, 8]), seen)
+        second, removed = dedup_exact(_df([2, 10, 7, 3]), seen)
+
+        assert first["trade_seq"].to_list() == [10, 3, 8]
+        assert second["trade_seq"].to_list() == [2, 7]
+        assert removed == 2
+
+    def test_large_file_merge_preserves_descending_unique_rows(self, tmp_path):
+        """Regression: the streaming merge previously kept only the first descending batch."""
+        data_dir = tmp_path / "future"
+        data_dir.mkdir()
+        source = data_dir / "BTC-TEST.jsonl"
+        source.write_text(
+            "".join(
+                f'{{"trade_seq":{seq},"instrument_name":"BTC-TEST","timestamp":1}}\n'
+                for seq in [5, 4, 3, 2, 1]
+            )
+        )
+        output = tmp_path / "future.parquet"
+
+        generate_parquet(
+            data_dir,
+            output,
+            dedup=True,
+            large_file_threshold=1,
+            stream_batch_size=2,
+        )
+
+        result = pl.read_parquet(output)
+        assert sorted(result["trade_seq"].to_list()) == [1, 2, 3, 4, 5]
+
+
+class TestAtomicParquetGeneration:
+    """A partial conversion must never be published as a successful output."""
+
+    def test_missing_data_directory_is_a_hard_failure(self, tmp_path):
+        """Missing input is an operational failure, not a successful no-op."""
+        with pytest.raises(FileNotFoundError, match="Data directory not found"):
+            generate_parquet(tmp_path / "missing", tmp_path / "output.parquet")
+
+    def test_empty_data_directory_is_a_hard_failure(self, tmp_path):
+        """An input directory without JSONL files cannot produce a valid dataset."""
+        data_dir = tmp_path / "future"
+        data_dir.mkdir()
+
+        with pytest.raises(ValueError, match="No JSONL files"):
+            generate_parquet(data_dir, tmp_path / "output.parquet")
+
+    def test_bad_json_preserves_previous_output_and_removes_temp_file(self, tmp_path):
+        """Reader failure must propagate without replacing the last known-good artifact."""
+        data_dir = tmp_path / "future"
+        data_dir.mkdir()
+        (data_dir / "BTC-BAD.jsonl").write_text("not-json\n")
+        output = tmp_path / "future.parquet"
+        previous = b"last-known-good-output"
+        output.write_bytes(previous)
+
+        with pytest.raises(RuntimeError, match="Failed to process JSONL file"):
+            generate_parquet(data_dir, output, large_file_threshold=10_000)
+
+        assert output.read_bytes() == previous
+        assert list(tmp_path.glob(f".{output.name}.*.tmp")) == []
+
+    def test_bad_parallel_block_preserves_previous_output(self, tmp_path):
+        """A subprocess block failure must propagate through the atomic writer."""
+        data_dir = tmp_path / "future"
+        data_dir.mkdir()
+        source = data_dir / "BTC-BAD.jsonl"
+        source.write_text(
+            '{"trade_seq":3,"instrument_name":"BTC-BAD","timestamp":1}\n'
+            "not-json\n"
+            '{"trade_seq":1,"instrument_name":"BTC-BAD","timestamp":1}\n'
+        )
+        output = tmp_path / "future.parquet"
+        previous = b"last-known-good-output"
+        output.write_bytes(previous)
+
+        with pytest.raises(RuntimeError, match="Failed to process.*block"):
+            generate_parquet(
+                data_dir,
+                output,
+                large_file_threshold=1,
+                stream_workers=2,
+                block_bytes=64,
+            )
+
+        assert output.read_bytes() == previous
+        assert list(tmp_path.glob(f".{output.name}.*.tmp")) == []
 
 
 # =============================================================================
@@ -427,9 +543,10 @@ class TestParallelRead:
     def jsonl_file(self):
         """Create a temp JSONL file suitable for dedup tests."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
-            # Write trades with monotonic seq; include some intentional intra-file dups
+            # Match real history API behavior: broadly descending, with duplicates
+            # appended out of order across later byte blocks.
             instr = "BTC-TEST"
-            for seq in range(1, 51):
+            for seq in range(50, 0, -1):
                 f.write(
                     f'{{"trade_seq":{seq},"instrument_name":"{instr}","price":50000,"timestamp":1}}\n'  # noqa: UP031
                 )

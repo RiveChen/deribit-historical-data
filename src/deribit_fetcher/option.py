@@ -66,7 +66,10 @@ async def fetch_option_chunk(tasking: dict, *, client: _OptionClientProtocol) ->
     last_seq_in_chunk = start_seq
 
     if trades:
-        last_seq_in_chunk = trades[0]["trade_seq"]
+        # The history endpoint's default ordering is not guaranteed.  Real
+        # responses are broadly descending but can contain local inversions,
+        # so advancing from trades[0] can skip rows that appear later.
+        last_seq_in_chunk = max(trade["trade_seq"] for trade in trades)
         # Continue if there's more data in this range or chunk was full
         if has_more or len(trades) >= settings.CHUNK_SIZE:
             should_continue = True
@@ -134,7 +137,7 @@ async def sync_option_db(
 
         for item in items:
             if item["data"]:
-                last_seq = item["data"][0]["trade_seq"]
+                last_seq = max(trade["trade_seq"] for trade in item["data"])
                 if last_seq > max_seq_in_batch:
                     max_seq_in_batch = last_seq
             if item.get("finished"):

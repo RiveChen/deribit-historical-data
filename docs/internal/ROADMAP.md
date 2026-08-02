@@ -2,6 +2,8 @@
 
 > 面向**自己手写实现**的学习路线。每个任务给出:目标 / 为什么 / 涉及文件 / 实现提示(不是完整答案)/ 验收标准 / 学习点 / 预估。
 > 按依赖顺序做;每做完一项,确保 `pytest` 全绿再进下一项。用 `git commit` 小步提交,commit message 写清楚「做了什么、为什么」。
+>
+> 2026-08-02 更新：原路线中的 `trade_seq > max_seen` 跨批去重假设已被真实写入顺序反例推翻；当前实现使用顺序无关的精确位图。以下相关任务已同步为精确去重验收。
 
 ## 如何使用本文档
 
@@ -101,7 +103,7 @@
   - 先识别**纯函数**:`_read_and_dedup_file`、`_stream_batches`、跨文件/跨批去重那几段。把去重从大函数里提成独立函数,签名类似:
     - `dedup_intra(df) -> tuple[df, int]`
     - `dedup_cross_file(df, seen: set[int]) -> tuple[df, int]`
-    - `dedup_cross_batch(df, max_seen: int) -> tuple[df, int]`
+    - `dedup_exact(df, seen_by_instrument) -> tuple[df, int]`
   - `generate_parquet` 变成编排这些纯函数的薄壳。
   - `scripts/gen_parquet.py` 变成 `from deribit_fetcher.parquet import generate_parquet` + CLI。
 - **验收**:
@@ -128,12 +130,12 @@
 ### P2-2 去重测试 ⭐
 - **目标**:三条去重路径各有针对性用例。
 - **依赖**:P1-3(先能 import)。
-- **提示**:用小 `pl.DataFrame` fixture,手工构造含重复 `trade_seq` 的数据。特别测**跨批单调过滤**的边界:`max_seen` 恰好等于某行 seq 时是否正确去掉。
+- **提示**:用小 `pl.DataFrame` fixture,手工构造含重复 `trade_seq` 的数据。必须覆盖 API chunk 内降序、future chunk 并发乱序和跨批重复，不能假设 JSONL 按 seq 递增。
 - **验收**:
   - [ ] 文件内重复被去掉、计数正确
   - [ ] 跨文件用 set 去重正确
-  - [ ] 跨批 `trade_seq > max_seen` 边界正确(等于时的行为有明确断言)
-- **学习点**:为什么「单文件内 seq 单调」能把 set 去重降级成一次比较(算法优化的前提是数据不变量);Polars 表达式测试。
+  - [x] 降序与乱序跨批输入保留全部唯一键，仅删除真实重复
+- **学习点**:算法优化必须建立在可验证的数据不变量上；API 返回顺序与并发落盘顺序是两层不同约束；位图如何以 1 bit/序号实现精确 membership。
 
 ### P2-3 gap 直方图测试
 - **提示**:构造已知有缺口的 seq 序列,断言每个 bucket 的 deficit。重点覆盖之前修过 bug 的**整数分桶**逻辑(`(seq-min)*N // total`),验证不再有浮点漂移。
@@ -166,7 +168,7 @@
 - **目标**:把 README 曾经吹过的「进程池 + 块对齐并行读取」**真的做出来**,并用 P2-2 的测试和 `benchmark.py` 证明加速。
 - **提示**:
   - 大文件按字节切成 `\n` 对齐的 block,`ProcessPoolExecutor` 里每个 worker 读一个 block → 反序列化 → 局部去重 → 返回。
-  - 难点:跨进程的**顺序**与**跨 block 去重**。因为 seq 单调,可按 block 起始偏移排序后再做一次跨 block 过滤。
+  - 难点:跨进程的**顺序**与**跨 block 去重**。block 可按起始偏移恢复输出顺序，但去重必须使用精确 membership，不能从文件偏移推断 seq 单调。
   - 加回 `--stream-workers` / `--block-bytes` 参数——这次是真的。跑 `benchmark.py --data-dir data/BTC/future` 对比单线程 vs 并行。
 - **验收**:
   - [ ] 并行结果与单线程**逐行一致**(同样的去重输出)

@@ -138,14 +138,30 @@ class FutureProgressRepo:
         """Mark chunks as done if they meet either finalize condition.
 
         A chunk is finalized when:
-        - count >= CHUNK_SIZE (chunk was full — all data in range was returned)
-        - has_more = 0 (no more data remaining in this range)
+        - the API confirms has_more = 0; and
+        - either count >= CHUNK_SIZE (the fixed range was full), or the
+          instrument is expired (its final partial range can no longer grow).
+
+        An active future's partial tail must remain pending.  Its last_seq can
+        grow into the same fixed chunk on a later run; finalizing that chunk
+        early would permanently skip the newly-added portion of the range.
+        A full-sized response with has_more = 1 also remains pending because
+        the API explicitly says additional rows in that range were not returned.
         """
         sql = """
             UPDATE future_chunk
             SET is_done = 1
             WHERE is_done = 0
-            AND (count >= ? OR has_more = 0)
+            AND has_more = 0
+            AND (
+                count >= ?
+                OR EXISTS (
+                    SELECT 1
+                    FROM future_meta
+                    WHERE future_meta.instrument = future_chunk.instrument
+                    AND future_meta.is_expired = 1
+                )
+            )
         """
         await self.db.execute(sql, (settings.CHUNK_SIZE,))
         await self.db.commit()
